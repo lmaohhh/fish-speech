@@ -295,8 +295,13 @@ class TextToSemantic(L.LightningModule):
             sync_dist=not is_train,
         )
 
-        # Top-5 accuracy
-        accuracy = self.get_accuracy(codebook_logits, filtered_codebook_labels)
+        # Top-5 accuracy (memory-efficient chunked computation)
+        accuracy = self.get_accuracy(
+            codebook_logits,
+            filtered_codebook_labels,
+            fast_hidden_states=outputs.fast_hidden_states,
+            fast_output=self.model.fast_output,
+        )
         self.log(
             f"{stage}/top_5_accuracy",
             accuracy,
@@ -309,7 +314,30 @@ class TextToSemantic(L.LightningModule):
 
         return loss
 
-    def get_accuracy(self, logits, labels):
+    def get_accuracy(self, logits, labels, fast_hidden_states=None, fast_output=None):
+        if logits is None and fast_hidden_states is not None and fast_output is not None:
+            flat_h = fast_hidden_states.reshape(-1, fast_hidden_states.size(-1))
+            flat_labels = labels.reshape(-1)
+            valid_mask = (flat_labels != -100) & (flat_labels != CODEBOOK_PAD_TOKEN_ID)
+            if not valid_mask.any():
+                return torch.tensor(0.0, device=labels.device)
+
+            v_h = flat_h[valid_mask]
+            v_l = flat_labels[valid_mask]
+            total_correct = 0
+            chunk_size = 512
+
+            with torch.no_grad():
+                for start in range(0, v_h.size(0), chunk_size):
+                    chunk_logits = fast_output(v_h[start : start + chunk_size])
+                    _, indices = chunk_logits.topk(5, dim=-1)
+                    total_correct += indices.eq(v_l[start : start + chunk_size].unsqueeze(-1)).sum().item()
+
+            return torch.tensor(total_correct / v_h.size(0), device=labels.device)
+
+        if logits is None:
+            return torch.tensor(0.0, device=labels.device)
+
         mask = (labels != -100) & (labels != CODEBOOK_PAD_TOKEN_ID)
         if mask.sum() == 0:
             return torch.tensor(0.0, device=logits.device)
