@@ -65,6 +65,11 @@ def train(cfg: DictConfig) -> tuple[dict, dict]:
 
     log.info("Instantiating loggers...")
     logger: list[Logger] = utils.instantiate_loggers(cfg.get("logger"))
+    if not logger:
+        callbacks = [
+            c for c in callbacks
+            if not isinstance(c, (L.pytorch.callbacks.LearningRateMonitor,))
+        ]
 
     log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
     trainer: Trainer = hydra.utils.instantiate(
