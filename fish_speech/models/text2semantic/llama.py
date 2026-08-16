@@ -1040,14 +1040,13 @@ class FeedForward(nn.Module):
         flat_x = x.reshape(-1, x.size(-1))
         num_tokens = flat_x.size(0)
 
-        # Chunk if total tokens > 1024 to keep peak cuBLAS memory under ~140 MB
-        # This handles both Slow Transformer (4096 tokens) and Fast Transformer (30,000 tokens)
-        if num_tokens > 1024:
-            out_chunks = []
-            for i in range(0, num_tokens, 1024):
-                chunk = flat_x[i : i + 1024]
-                out_chunks.append(self.w2(F.silu(self.w1(chunk)) * self.w3(chunk)))
-            out = torch.cat(out_chunks, dim=0)
+        # Chunk if total tokens > 512 to keep peak memory strictly under ~70 MB
+        # Using pre-allocated tensor eliminates list accumulation and cat() duplication
+        if num_tokens > 512:
+            out = torch.empty_like(flat_x)
+            for i in range(0, num_tokens, 512):
+                chunk = flat_x[i : i + 512]
+                out[i : i + 512] = self.w2(F.silu(self.w1(chunk)) * self.w3(chunk))
             return out.view(orig_shape)
 
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
