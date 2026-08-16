@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import math
+import os
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -548,8 +549,15 @@ class BaseTransformer(nn.Module):
             single_st = path_obj / "model.safetensors"
             pth_file = path_obj / "model.pth"
 
+            # Determine load device: use local GPU to avoid CPU RAM exhaustion
+            # with FSDP multi-process (each process loads full model to CPU = 2×9.2GB OOM)
+            _load_device = "cpu"
+            if torch.cuda.is_available():
+                _local_rank = int(os.environ.get("LOCAL_RANK", 0))
+                _load_device = f"cuda:{_local_rank}"
+
             if index_json.exists():
-                logger.info("Loading sharded safetensors weights")
+                logger.info(f"Loading sharded safetensors weights to {_load_device}")
                 from safetensors.torch import load_file as st_load_file
 
                 with open(index_json) as f:
@@ -557,13 +565,13 @@ class BaseTransformer(nn.Module):
                 shard_files = sorted(set(st_index["weight_map"].values()))
                 weights = OrderedDict()
                 for shard in shard_files:
-                    weights.update(st_load_file(str(path_obj / shard), device="cpu"))
+                    weights.update(st_load_file(str(path_obj / shard), device=_load_device))
                 weights = _remap_fish_qwen3_omni_keys(weights)
             elif single_st.exists():
-                logger.info("Loading single safetensors weights")
+                logger.info(f"Loading single safetensors weights to {_load_device}")
                 from safetensors.torch import load_file as st_load_file
 
-                weights = OrderedDict(st_load_file(str(single_st), device="cpu"))
+                weights = OrderedDict(st_load_file(str(single_st), device=_load_device))
                 weights = _remap_fish_qwen3_omni_keys(weights)
             elif pth_file.exists():
                 weights = torch.load(
