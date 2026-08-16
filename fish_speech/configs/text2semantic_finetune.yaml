@@ -83,4 +83,6 @@ model:
 # Callbacks
 callbacks:
   model_checkpoint:
-    every_n_train_steps: ${trainer.val_check_interval}
+    every_n_train_steps: 100
+    save_last: true
+    monitor: null

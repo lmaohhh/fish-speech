@@ -276,6 +276,15 @@ class TextToSemantic(L.LightningModule):
         )
 
         self.log(
+            "step",
+            float(self.global_step),
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            logger=True,
+        )
+
+        self.log(
             f"{stage}/base_loss",
             base_loss,
             on_step=is_train,
