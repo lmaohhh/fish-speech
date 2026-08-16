@@ -4,13 +4,16 @@ import sys
 os.environ["USE_LIBUV"] = "0"
 
 # Block TensorFlow & JAX from loading (saves ~3-4 GB RAM per process)
-# The `datasets` library auto-imports them if available, wasting RAM
+# Must use proper ModuleSpec or torch._dynamo.trace_rules.find_spec() crashes
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+import importlib.machinery
 for _blocked in ("tensorflow", "tensorflow.python", "tensorflow.core", "jax", "jaxlib"):
     if _blocked not in sys.modules:
-        sys.modules[_blocked] = type(sys)(_blocked)
-del _blocked
+        _mock = type(sys)(_blocked)
+        _mock.__spec__ = importlib.machinery.ModuleSpec(_blocked, None)
+        sys.modules[_blocked] = _mock
+del _blocked, _mock
 from typing import Optional
 
 import hydra
