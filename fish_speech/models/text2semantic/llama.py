@@ -1036,12 +1036,20 @@ class FeedForward(nn.Module):
         self.w2 = nn.Linear(config.intermediate_size, config.dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        # For long sequences, process in chunks of 1024 tokens to reduce peak cuBLAS GEMM memory by 4x
-        if x.size(1) > 1024:
-            num_chunks = (x.size(1) + 1023) // 1024
-            chunks = x.chunk(num_chunks, dim=1)
-            out_chunks = [self.w2(F.silu(self.w1(c)) * self.w3(c)) for c in chunks]
-            return torch.cat(out_chunks, dim=1)
+        orig_shape = x.shape
+        flat_x = x.reshape(-1, x.size(-1))
+        num_tokens = flat_x.size(0)
+
+        # Chunk if total tokens > 1024 to keep peak cuBLAS memory under ~140 MB
+        # This handles both Slow Transformer (4096 tokens) and Fast Transformer (30,000 tokens)
+        if num_tokens > 1024:
+            out_chunks = []
+            for i in range(0, num_tokens, 1024):
+                chunk = flat_x[i : i + 1024]
+                out_chunks.append(self.w2(F.silu(self.w1(chunk)) * self.w3(chunk)))
+            out = torch.cat(out_chunks, dim=0)
+            return out.view(orig_shape)
+
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
