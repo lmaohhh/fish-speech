@@ -14,11 +14,11 @@ from fish_speech.models.text2semantic.llama import NaiveTransformer
 log = utils.RankedLogger(__name__, rank_zero_only=True)
 
 
-def compute_chunked_base_loss(hidden_states, lm_head, labels, chunk_size: int = 512):
+def compute_chunked_base_loss(hidden_states, lm_head, labels, chunk_size: int = 256):
     """
     Computes cross-entropy loss in small token chunks to avoid materializing
     the massive (seq_len, vocab_size) logits tensor (1.19 GB in FP16).
-    Peak memory per chunk: only ~150 MB.
+    Peak memory per chunk: only ~80 MB.
     Mathematically identical to standard cross-entropy.
     """
     flat_h = hidden_states.reshape(-1, hidden_states.size(-1))
@@ -233,7 +233,7 @@ class TextToSemantic(L.LightningModule):
                 hidden_states=outputs.hidden_states,
                 lm_head=lm_head,
                 labels=labels[:, 0],
-                chunk_size=512,
+                chunk_size=256,
             )
         else:
             base_loss = F.cross_entropy(
