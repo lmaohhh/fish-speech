@@ -598,7 +598,7 @@ class SemanticDataModule(LightningDataModule):
             batch_size=self.batch_size,
             collate_fn=TextDataCollator(self.tokenizer, self.max_length),
             num_workers=self.num_workers,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
         )
 
     def val_dataloader(self):
@@ -607,7 +607,7 @@ class SemanticDataModule(LightningDataModule):
             batch_size=self.batch_size,
             collate_fn=TextDataCollator(self.tokenizer, self.max_length),
             num_workers=self.num_workers,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
         )
 
 
