@@ -13,7 +13,7 @@ class LoraConfig:
     # Unprefixed names target the slow transformer (and fast too for backwards compat).
     # "fast_*" names target only the fast transformer.
     target_modules: list = field(
-        default_factory=lambda: ["attention", "mlp", "embeddings", "output"]
+        default_factory=lambda: ["attention", "fast_attention"]
     )
 
 
