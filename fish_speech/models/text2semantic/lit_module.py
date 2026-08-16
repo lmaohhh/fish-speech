@@ -60,7 +60,7 @@ def compute_chunked_base_loss(hidden_states, lm_head, labels, chunk_size: int = 
             )
             total_loss = total_loss + chunk_loss
 
-    return (total_loss / torch.clamp(total_valid, min=1)).to(dtype=hidden_states.dtype)
+    return total_loss / torch.clamp(total_valid, min=1)
 
 
 def compute_chunked_semantic_loss(
@@ -105,7 +105,7 @@ def compute_chunked_semantic_loss(
             )
             total_loss = total_loss + chunk_loss
 
-    return (total_loss / torch.clamp(total_valid, min=1)).to(dtype=fast_hidden_states.dtype)
+    return total_loss / torch.clamp(total_valid, min=1)
 
 
 class TextToSemantic(L.LightningModule):
