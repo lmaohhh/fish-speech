@@ -63,6 +63,51 @@ def compute_chunked_base_loss(hidden_states, lm_head, labels, chunk_size: int = 
     return (total_loss / torch.clamp(total_valid, min=1)).to(dtype=hidden_states.dtype)
 
 
+def compute_chunked_semantic_loss(
+    fast_hidden_states: torch.Tensor,
+    fast_output: nn.Module,
+    filtered_codebook_labels: torch.Tensor,
+    chunk_size: int = 512,
+) -> torch.Tensor:
+    """
+    Computes semantic cross-entropy loss in small token chunks directly from
+    fast_hidden_states, avoiding the 245.76 MB codebook_logits allocation.
+    Saves ~450 MB VRAM during training.
+    """
+    flat_h = fast_hidden_states.reshape(-1, fast_hidden_states.size(-1))
+    flat_labels = filtered_codebook_labels.reshape(-1)
+
+    valid_mask = flat_labels != -100
+    total_valid = valid_mask.sum()
+    if total_valid == 0:
+        return torch.tensor(
+            0.0,
+            device=fast_hidden_states.device,
+            dtype=fast_hidden_states.dtype,
+            requires_grad=True,
+        )
+
+    total_loss = torch.tensor(0.0, device=fast_hidden_states.device, dtype=torch.float32)
+    num_tokens = flat_h.size(0)
+
+    for start in range(0, num_tokens, chunk_size):
+        end = min(start + chunk_size, num_tokens)
+        chunk_h = flat_h[start:end]
+        chunk_labels = flat_labels[start:end]
+
+        if (chunk_labels != -100).any():
+            chunk_logits = fast_output(chunk_h)
+            chunk_loss = F.cross_entropy(
+                chunk_logits.float(),
+                chunk_labels,
+                ignore_index=-100,
+                reduction="sum",
+            )
+            total_loss = total_loss + chunk_loss
+
+    return (total_loss / torch.clamp(total_valid, min=1)).to(dtype=fast_hidden_states.dtype)
+
+
 class TextToSemantic(L.LightningModule):
     def __init__(
         self,
@@ -203,12 +248,19 @@ class TextToSemantic(L.LightningModule):
         )
         all_codebook_labels = labels[:, 1 : 1 + self.model.config.num_codebooks]
         all_codebook_labels_permuted = all_codebook_labels.permute(0, 2, 1)
-        filtered_codebook_labels = all_codebook_labels_permuted[semantic_mask]
-        semantic_loss = F.cross_entropy(
-            codebook_logits.reshape(-1, codebook_logits.size(-1)),
-            filtered_codebook_labels.reshape(-1),
-            ignore_index=-100,
-        )
+        if codebook_logits is None and outputs.fast_hidden_states is not None:
+            semantic_loss = compute_chunked_semantic_loss(
+                fast_hidden_states=outputs.fast_hidden_states,
+                fast_output=self.model.fast_output,
+                filtered_codebook_labels=filtered_codebook_labels,
+                chunk_size=512,
+            )
+        else:
+            semantic_loss = F.cross_entropy(
+                codebook_logits.reshape(-1, codebook_logits.size(-1)),
+                filtered_codebook_labels.reshape(-1),
+                ignore_index=-100,
+            )
 
         loss = base_loss + semantic_loss
 

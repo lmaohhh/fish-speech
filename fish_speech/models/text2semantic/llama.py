@@ -218,8 +218,9 @@ class KVCache(nn.Module):
 @dataclass
 class TransformerForwardResult:
     token_logits: Optional[Tensor]
-    codebook_logits: Tensor
+    codebook_logits: Optional[Tensor] = None
     hidden_states: Optional[Tensor] = None
+    fast_hidden_states: Optional[Tensor] = None
 
 
 @dataclass
@@ -367,11 +368,17 @@ class BaseTransformer(nn.Module):
             atten_mask = atten_mask.logical_not()
             mask = causal & atten_mask
 
-        for layer in self.layers:
+        def run_layer_block(block_layers, h, freqs, m):
+            for l in block_layers:
+                h = l(h, freqs, m)
+            return h
+
+        for i in range(0, len(self.layers), 2):
+            block_layers = self.layers[i : i + 2]
             if self.config.use_gradient_checkpointing and self.training:
-                x = checkpoint(layer, x, freqs_cis, mask, use_reentrant=False)
+                x = checkpoint(run_layer_block, block_layers, x, freqs_cis, mask, use_reentrant=False)
             else:
-                x = layer(x, freqs_cis, mask)
+                x = run_layer_block(block_layers, x, freqs_cis, mask)
 
         slow_out = self.norm(x)
 
@@ -830,22 +837,36 @@ class DualARTransformer(BaseTransformer):
         codebook_embeddings = self.fast_embeddings(codebooks)
         x = torch.cat([x[:, None], codebook_embeddings], dim=1)
 
-        for layer in self.fast_layers:
+        def run_fast_block(block_layers, h, freqs, m):
+            for l in block_layers:
+                h = l(h, freqs, m)
+            return h
+
+        for i in range(0, len(self.fast_layers), 2):
+            block_layers = self.fast_layers[i : i + 2]
             if self.config.use_gradient_checkpointing and self.training:
-                x = checkpoint(layer, x, fast_freqs_cis, fast_mask, use_reentrant=False)
+                x = checkpoint(run_fast_block, block_layers, x, fast_freqs_cis, fast_mask, use_reentrant=False)
             else:
-                x = layer(x, fast_freqs_cis, fast_mask)
+                x = run_fast_block(block_layers, x, fast_freqs_cis, fast_mask)
 
         # unflatten the batch and num_codebooks
         fast_out = self.fast_norm(x)
-        codebook_logits = self.fast_output(fast_out)
 
-        assert codebook_logits.shape[1] == self.config.num_codebooks
+        if self.training:
+            # Skip materializing 245.76 MB codebook_logits tensor during training
+            # Loss will be computed in memory-efficient chunks directly from fast_hidden_states (saves ~450 MB VRAM)
+            codebook_logits = None
+            fast_hidden_states = fast_out
+        else:
+            codebook_logits = self.fast_output(fast_out)
+            fast_hidden_states = None
+            assert codebook_logits.shape[1] == self.config.num_codebooks
 
         return TransformerForwardResult(
             token_logits=token_logits,
             codebook_logits=codebook_logits,
             hidden_states=parent_result.hidden_states,
+            fast_hidden_states=fast_hidden_states,
         )
 
     def forward_generate_fast(
