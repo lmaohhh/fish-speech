@@ -519,9 +519,22 @@ class BaseTransformer(nn.Module):
                 raise ValueError(f"Unknown model type: {config.model_type}")
 
         logger.info(f"Loading model from {path}, config: {config}")
-        # Initialize model without passing tokenizer explicitly to __init__
-        model = model_cls(config)
-        # Attach tokenizer to model instance for inference convenience (optional, but good for user scripts)
+
+        # Determine target device for weight loading
+        _load_device = "cpu"
+        if torch.cuda.is_available():
+            _local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            _load_device = f"cuda:{_local_rank}"
+
+        if load_weights:
+            # Initialize model on meta device (0 bytes CPU/GPU RAM)
+            # This prevents 2×9.2GB CPU RAM OOM when FSDP spawns 2 subprocesses
+            with torch.device("meta"):
+                model = model_cls(config)
+            logger.info(f"Model shell created on meta device (0 bytes RAM)")
+        else:
+            model = model_cls(config)
+
         model.tokenizer = tokenizer
 
         if load_weights is False:
@@ -549,13 +562,6 @@ class BaseTransformer(nn.Module):
             single_st = path_obj / "model.safetensors"
             pth_file = path_obj / "model.pth"
 
-            # Determine load device: use local GPU to avoid CPU RAM exhaustion
-            # with FSDP multi-process (each process loads full model to CPU = 2×9.2GB OOM)
-            _load_device = "cpu"
-            if torch.cuda.is_available():
-                _local_rank = int(os.environ.get("LOCAL_RANK", 0))
-                _load_device = f"cuda:{_local_rank}"
-
             if index_json.exists():
                 logger.info(f"Loading sharded safetensors weights to {_load_device}")
                 from safetensors.torch import load_file as st_load_file
@@ -576,7 +582,7 @@ class BaseTransformer(nn.Module):
             elif pth_file.exists():
                 weights = torch.load(
                     pth_file,
-                    map_location="cpu",
+                    map_location=_load_device,
                     mmap=True,
                     weights_only=True,
                 )
@@ -594,6 +600,34 @@ class BaseTransformer(nn.Module):
 
             err = model.load_state_dict(weights, strict=False, assign=True)
             logger.info(f"Model weights loaded - Status: {err}")
+
+            # Re-materialize non-persistent buffers (they were on meta device)
+            _buf_device = _load_device
+            model.register_buffer(
+                "freqs_cis",
+                precompute_freqs_cis(
+                    config.max_seq_len, config.head_dim, config.rope_base
+                ).to(_buf_device),
+                persistent=False,
+            )
+            model.register_buffer(
+                "causal_mask",
+                torch.tril(
+                    torch.ones(config.max_seq_len, config.max_seq_len,
+                               dtype=torch.bool, device=_buf_device)
+                ),
+                persistent=False,
+            )
+            # DualARTransformer has fast_freqs_cis
+            if hasattr(model, "fast_freqs_cis"):
+                model.register_buffer(
+                    "fast_freqs_cis",
+                    precompute_freqs_cis(
+                        config.num_codebooks, config.fast_head_dim, config.rope_base
+                    ).to(_buf_device),
+                    persistent=False,
+                )
+            logger.info(f"Buffers re-materialized on {_buf_device}")
 
         if lora_config is not None:
             setup_lora(model, lora_config)
