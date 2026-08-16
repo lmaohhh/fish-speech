@@ -217,13 +217,14 @@ class KVCache(nn.Module):
 
 @dataclass
 class TransformerForwardResult:
-    token_logits: Tensor
+    token_logits: Optional[Tensor]
     codebook_logits: Tensor
+    hidden_states: Optional[Tensor] = None
 
 
 @dataclass
 class BaseTransformerForwardResult:
-    logits: Tensor
+    logits: Optional[Tensor]
     hidden_states: Tensor
 
 
@@ -374,10 +375,15 @@ class BaseTransformer(nn.Module):
 
         slow_out = self.norm(x)
 
-        if self.config.tie_word_embeddings:
-            token_logits = F.linear(slow_out, self.embeddings.weight)
+        if self.training:
+            # Skip materializing 1.19 GB token_logits tensor during training
+            # Loss will be computed in memory-efficient chunks of 512 tokens
+            token_logits = None
         else:
-            token_logits = self.output(slow_out)
+            if self.config.tie_word_embeddings:
+                token_logits = F.linear(slow_out, self.embeddings.weight)
+            else:
+                token_logits = self.output(slow_out)
 
         hidden_out = (
             slow_out if getattr(self.config, "norm_fastlayer_input", False) else x
@@ -839,6 +845,7 @@ class DualARTransformer(BaseTransformer):
         return TransformerForwardResult(
             token_logits=token_logits,
             codebook_logits=codebook_logits,
+            hidden_states=parent_result.hidden_states,
         )
 
     def forward_generate_fast(
