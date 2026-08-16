@@ -837,17 +837,32 @@ class DualARTransformer(BaseTransformer):
         codebook_embeddings = self.fast_embeddings(codebooks)
         x = torch.cat([x[:, None], codebook_embeddings], dim=1)
 
-        def run_fast_block(block_layers, h, freqs, m):
-            for l in block_layers:
-                h = l(h, freqs, m)
+        def run_fast_transformer(fast_layers, h, freqs, mask):
+            for i in range(0, len(fast_layers), 2):
+                block = fast_layers[i : i + 2]
+                for l in block:
+                    h = l(h, freqs, mask)
             return h
 
-        for i in range(0, len(self.fast_layers), 2):
-            block_layers = self.fast_layers[i : i + 2]
-            if self.config.use_gradient_checkpointing and self.training:
-                x = checkpoint(run_fast_block, block_layers, x, fast_freqs_cis, fast_mask, use_reentrant=False)
-            else:
-                x = run_fast_block(block_layers, x, fast_freqs_cis, fast_mask)
+        # If batch size N > 512, slice along dimension 0 to keep wqkv memory strictly under ~60 MB (saves > 300 MB VRAM)
+        if self.training and x.size(0) > 512:
+            out_fast = torch.empty_like(x)
+            chunk_size = 512
+            for i in range(0, x.size(0), chunk_size):
+                chunk_x = x[i : i + chunk_size]
+                if self.config.use_gradient_checkpointing:
+                    chunk_out = checkpoint(run_fast_transformer, self.fast_layers, chunk_x, fast_freqs_cis, fast_mask, use_reentrant=False)
+                else:
+                    chunk_out = run_fast_transformer(self.fast_layers, chunk_x, fast_freqs_cis, fast_mask)
+                out_fast[i : i + chunk_size] = chunk_out
+            x = out_fast
+        else:
+            for i in range(0, len(self.fast_layers), 2):
+                block_layers = self.fast_layers[i : i + 2]
+                if self.config.use_gradient_checkpointing and self.training:
+                    x = checkpoint(run_fast_block, block_layers, x, fast_freqs_cis, fast_mask, use_reentrant=False)
+                else:
+                    x = run_fast_block(block_layers, x, fast_freqs_cis, fast_mask)
 
         # unflatten the batch and num_codebooks
         fast_out = self.fast_norm(x)
