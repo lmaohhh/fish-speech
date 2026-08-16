@@ -248,6 +248,7 @@ class TextToSemantic(L.LightningModule):
         )
         all_codebook_labels = labels[:, 1 : 1 + self.model.config.num_codebooks]
         all_codebook_labels_permuted = all_codebook_labels.permute(0, 2, 1)
+        filtered_codebook_labels = all_codebook_labels_permuted[semantic_mask]
         if codebook_logits is None and outputs.fast_hidden_states is not None:
             semantic_loss = compute_chunked_semantic_loss(
                 fast_hidden_states=outputs.fast_hidden_states,
