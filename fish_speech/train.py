@@ -103,16 +103,12 @@ def train(cfg: DictConfig) -> tuple[dict, dict]:
             auto_resume = True
 
         if ckpt_path is not None:
-            log.info(f"Resuming from checkpoint: {ckpt_path}")
-
-        # resume weights only is disabled for auto-resume
-        if cfg.get("resume_weights_only") and auto_resume is False:
-            log.info("Resuming weights only!")
+            log.info(f"Resuming weights from checkpoint (strict=False for LoRA): {ckpt_path}")
             ckpt = torch.load(ckpt_path, map_location=model.device)
-            if "state_dict" in ckpt:
+            if isinstance(ckpt, dict) and "state_dict" in ckpt:
                 ckpt = ckpt["state_dict"]
             err = model.load_state_dict(ckpt, strict=False)
-            log.info(f"Error loading state dict: {err}")
+            log.info(f"Checkpoint loaded successfully - Missing: {len(err.missing_keys)}, Unexpected: {len(err.unexpected_keys)}")
             ckpt_path = None
 
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
