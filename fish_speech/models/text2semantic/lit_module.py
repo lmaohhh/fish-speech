@@ -41,9 +41,12 @@ class TextToSemantic(L.LightningModule):
                 state_dict.pop(name)
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
-        # Get weight decay parameters
+        # Get weight decay parameters ONLY for trainable (requires_grad=True) parameters
+        # This prevents AdamW from tracking 4.6B frozen parameters which causes huge RAM spikes
         weight_decay_parameters, other_parameters = [], []
         for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
             if ".bias" in name or "norm.weight" in name or ".embeddings." in name:
                 other_parameters.append(param)
             else:

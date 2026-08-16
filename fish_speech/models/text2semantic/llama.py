@@ -599,6 +599,9 @@ class BaseTransformer(nn.Module):
                 raise FileNotFoundError(f"No model weights found in {path_obj}")
 
             err = model.load_state_dict(weights, strict=False, assign=True)
+            del weights
+            import gc
+            gc.collect()
             logger.info(f"Model weights loaded - Status: {err}")
 
             # Re-materialize non-persistent buffers (they were on meta device)
