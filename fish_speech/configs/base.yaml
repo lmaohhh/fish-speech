@@ -59,6 +59,10 @@ callbacks:
   progress_bar:
     _target_: fish_speech.callbacks.GradAccumProgressBar
 
+  auto_sync:
+    _target_: fish_speech.callbacks.AutoSyncCallback
+    export_dir: "/kaggle/working"
+
 # Logger
 logger:
   tensorboard:
