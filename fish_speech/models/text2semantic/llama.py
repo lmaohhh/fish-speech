@@ -1040,13 +1040,13 @@ class FeedForward(nn.Module):
         flat_x = x.reshape(-1, x.size(-1))
         num_tokens = flat_x.size(0)
 
-        # Chunk if total tokens > 512 to keep peak memory strictly under ~70 MB
+        # Chunk if total tokens > 128 to keep peak memory strictly under ~2.5 MB per chunk
         # Using pre-allocated tensor eliminates list accumulation and cat() duplication
-        if num_tokens > 512:
+        if num_tokens > 128:
             out = torch.empty_like(flat_x)
-            for i in range(0, num_tokens, 512):
-                chunk = flat_x[i : i + 512]
-                out[i : i + 512] = self.w2(F.silu(self.w1(chunk)) * self.w3(chunk))
+            for i in range(0, num_tokens, 128):
+                chunk = flat_x[i : i + 128]
+                out[i : i + 128] = self.w2(F.silu(self.w1(chunk)) * self.w3(chunk))
             return out.view(orig_shape)
 
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
