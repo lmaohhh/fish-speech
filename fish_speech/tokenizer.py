@@ -54,6 +54,10 @@ ALL_SPECIAL_TOKENS = [
 
 class FishTokenizer:
     def __init__(self, model_path: str):
+        self.model_path = model_path
+        self._load_tokenizer(model_path)
+
+    def _load_tokenizer(self, model_path: str):
         self._tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.semantic_id_to_token_id = {}
 
@@ -73,12 +77,10 @@ class FishTokenizer:
             )
             self.semantic_begin_id = 0
             self.semantic_end_id = 0
-            # Dummy tensor to prevent crash, though generation will fail
             self.semantic_map_tensor = torch.zeros(4096, dtype=torch.long)
         else:
             self.semantic_begin_id = min(valid_ids)
             self.semantic_end_id = max(valid_ids)
-            # Create a lookup tensor to handle potential gaps in token IDs safely
             self.semantic_map_tensor = torch.zeros(4096, dtype=torch.long)
             for k, v in self.semantic_id_to_token_id.items():
                 self.semantic_map_tensor[k] = v
@@ -122,11 +124,15 @@ class FishTokenizer:
         self._tokenizer.save_pretrained(path)
 
     @classmethod
+    def from_pretrained(cls, path: str):
+        return cls(path)
+
     def __getstate__(self):
-        return self.__dict__
+        return {"model_path": self.model_path}
 
     def __setstate__(self, state):
-        self.__dict__.update(state)
+        self.model_path = state["model_path"]
+        self._load_tokenizer(self.model_path)
 
     def __getattr__(self, name):
         if name == "_tokenizer" or "_tokenizer" not in self.__dict__:
