@@ -818,62 +818,47 @@ class DualARTransformer(BaseTransformer):
         ]  # (B, N, Q, K)
         fast_freqs_cis = self.fast_freqs_cis[:fast_seq_len]
 
-        # Extract corresponding parts with labels
-        token_labels = labels[:, 0]
-
-        # [MODIFIED] Use config instead of tokenizer
-        codebook_mask = (token_labels >= self.config.semantic_begin_id) & (
-            token_labels <= self.config.semantic_end_id
-        )
-
-        # This gives where input token is <|semantic|>
-        x = x[codebook_mask]
-
-        if x.shape[0] == 0:
-            # Use dummy input when no vq is required
-            x = torch.zeros(
-                (4, self.config.dim),
-                device=x.device,
-                dtype=x.dtype,
-            )
-            codebooks = torch.zeros(
-                (x.shape[0], self.config.num_codebooks - 1),
-                device=x.device,
-                dtype=torch.int,
-            )
-        else:
+        if self.training:
+            # Static shape for Fast Transformer: Maintain fixed B*S=2048 to prevent XLA JIT recompilation per step
             all_codebooks = labels[:, 1:, :]
             all_codebooks_permuted = all_codebooks.permute(0, 2, 1)
-            semantic_codebooks = all_codebooks_permuted[codebook_mask]
-            codebooks = semantic_codebooks[:, :-1]
+            codebooks = all_codebooks_permuted[:, :, :-1].reshape(-1, self.config.num_codebooks - 1)
+            x = x.reshape(-1, x.size(-1))
+            valid_codebooks = torch.clamp(codebooks, min=0, max=self.config.codebook_size - 1)
+        else:
+            token_labels = labels[:, 0]
+            codebook_mask = (token_labels >= self.config.semantic_begin_id) & (
+                token_labels <= self.config.semantic_end_id
+            )
+            x = x[codebook_mask]
+            if x.shape[0] == 0:
+                x = torch.zeros((4, self.config.dim), device=x.device, dtype=x.dtype)
+                codebooks = torch.zeros((x.shape[0], self.config.num_codebooks - 1), device=x.device, dtype=torch.int)
+                valid_codebooks = codebooks
+            else:
+                all_codebooks = labels[:, 1:, :]
+                all_codebooks_permuted = all_codebooks.permute(0, 2, 1)
+                semantic_codebooks = all_codebooks_permuted[codebook_mask]
+                codebooks = semantic_codebooks[:, :-1]
+                valid_codebooks = torch.clamp(codebooks, min=0, max=self.config.codebook_size - 1)
 
         x = self.fast_project_in(x)
 
-        # Micro-chunking Fast Transformer with on-the-fly embedding (chunk_size=64)
-        # Avoids allocating the 76.17 MB [1553, 10, 2560] buffer and saves >400 MB HBM
-        if x.size(0) > 64:
-            fast_chunks = []
-            for start_idx in range(0, x.size(0), 64):
-                x_sub = x[start_idx : start_idx + 64]
-                cb_sub = codebooks[start_idx : start_idx + 64]
-                cb_embed_sub = self.fast_embeddings(cb_sub)
-                x_c = torch.cat([x_sub[:, None], cb_embed_sub], dim=1)
+        # Micro-chunking Fast Transformer with static 64-token chunks (always 32 chunks for seq_len=2048)
+        fast_chunks = []
+        for start_idx in range(0, x.size(0), 64):
+            x_sub = x[start_idx : start_idx + 64]
+            cb_sub = valid_codebooks[start_idx : start_idx + 64]
+            cb_embed_sub = self.fast_embeddings(cb_sub)
+            x_c = torch.cat([x_sub[:, None], cb_embed_sub], dim=1)
 
-                for layer in self.fast_layers:
-                    if self.config.use_gradient_checkpointing and self.training:
-                        x_c = checkpoint(layer, x_c, fast_freqs_cis, fast_mask, use_reentrant=False)
-                    else:
-                        x_c = layer(x_c, fast_freqs_cis, fast_mask)
-                fast_chunks.append(x_c)
-            x = torch.cat(fast_chunks, dim=0)
-        else:
-            codebook_embeddings = self.fast_embeddings(codebooks)
-            x = torch.cat([x[:, None], codebook_embeddings], dim=1)
             for layer in self.fast_layers:
                 if self.config.use_gradient_checkpointing and self.training:
-                    x = checkpoint(layer, x, fast_freqs_cis, fast_mask, use_reentrant=False)
+                    x_c = checkpoint(layer, x_c, fast_freqs_cis, fast_mask, use_reentrant=False)
                 else:
-                    x = layer(x, fast_freqs_cis, fast_mask)
+                    x_c = layer(x_c, fast_freqs_cis, fast_mask)
+            fast_chunks.append(x_c)
+        x = torch.cat(fast_chunks, dim=0)
 
         # unflatten the batch and num_codebooks
         fast_out = self.fast_norm(x)
