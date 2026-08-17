@@ -1,3 +1,5 @@
+import functools
+import os
 from pathlib import Path
 from typing import Sequence
 
@@ -5,11 +7,19 @@ import rich
 import rich.syntax
 import rich.tree
 from hydra.core.hydra_config import HydraConfig
-from lightning.pytorch.utilities import rank_zero_only
 from omegaconf import DictConfig, OmegaConf, open_dict
 from rich.prompt import Prompt
 
 from fish_speech.utils import logger as log
+
+
+def rank_zero_only(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+        if rank == 0:
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 @rank_zero_only

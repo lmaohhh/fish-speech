@@ -1,6 +1,16 @@
-from lightning.pytorch.utilities import rank_zero_only
+import functools
+import os
 
 from fish_speech.utils import logger as log
+
+
+def rank_zero_only(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+        if rank == 0:
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 @rank_zero_only
