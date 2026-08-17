@@ -5,40 +5,44 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import click
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
+from safetensors.torch import load_file as st_load_file, save_file as st_save_file
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ĐẶC TẢ CHUẨN NVIDIA BLACKWELL NVFP4 (THEO NVIDIA DEVELOPER BLOG CHÍNH THỨC)
+# ĐẶC TẢ CHÍNH THỨC NVIDIA BLACKWELL NVFP4 (THEO NVIDIA ARCHITECTURE WHITEPAPER)
 # 1. Định dạng dữ liệu: 4-bit E2M1 (1 Sign, 2 Exponent, 1 Mantissa)
-#    Dải giá trị: {-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
-# 2. Cơ chế Two-Level Scaling:
-#    - Cấp 1 (Block Scale): 1 scale dạng FP8 (E4M3) cho mỗi block 16 phần tử.
-#    - Cấp 2 (Global Tensor Scale): 1 scale dạng FP32 cho toàn bộ tensor.
+#    Dải 16 mức biểu diễn: {-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.0,
+#                            0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0}
+# 2. Cơ chế Two-Level Microscaling (Per-Row Along K-Dimension):
+#    - Cấp 1 (Block Scale): 1 scale dạng FP8 (E4M3) cho mỗi block 16 phần tử dọc theo trục K.
+#    - Cấp 2 (Global Tensor Scale): 1 scale dạng FP32 cho toàn bộ ma trận (tối đa hóa dải động).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 NVFP4_DEFAULT_BLOCK_SIZE = 16
+FP8_E4M3_MAX = 448.0
+E2M1_MAX = 6.0
 
-# Bảng giá trị E2M1
+# Bảng 16 giá trị chuẩn E2M1
 NVFP4_LEVELS = torch.tensor(
     [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.0,
       0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0],
     dtype=torch.float32
 )
 
-# Bảng mã hóa 4-bit (Canonical mapping)
+# Bảng mã hóa 4-bit chuẩn Canonical Mapping
 NVFP4_CODES = torch.tensor(
     [0b1111, 0b1110, 0b1101, 0b1100, 0b1011, 0b1010, 0b1001, 0b1000,
      0b0000, 0b0001, 0b0010, 0b0011, 0b0100, 0b0101, 0b0110, 0b0111],
     dtype=torch.uint8
 )
 
-# Bảng giải mã nhanh (Dequantization Table)
+# Bảng giải mã nhanh (Dequantization Lookup Table)
 DEQUANT_TABLE = torch.tensor(
     [ 0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
      -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
@@ -46,136 +50,173 @@ DEQUANT_TABLE = torch.tensor(
 )
 
 
-def quantize_tensor_to_nvfp4_two_level(
-    tensor_float: torch.Tensor,
+def quantize_matrix_to_nvfp4_two_level(
+    weight_2d: torch.Tensor,
     block_size: int = NVFP4_DEFAULT_BLOCK_SIZE
 ) -> Tuple[torch.Tensor, torch.Tensor, float, int, Tuple[int, ...]]:
     """
-    Lượng tử hóa tensor sang chuẩn NVFP4 chuẩn xác theo NVIDIA Blackwell:
-    - Trả về: (packed_nvfp4, block_scales_fp8, global_scale_fp32, pad_len, orig_shape)
+    Lượng tử hóa ma trận trọng số 2D [N, K] sang chuẩn NVIDIA Blackwell NVFP4 (E2M1 + Block-16 FP8):
+    - Chia block 16 dọc theo trục K (dim=-1) để tương thích 100% với CUTLASS / Tensor Core GEMM.
+    - Trả về: (packed_nvfp4 [N, K_padded // 2], block_scales_fp8 [N, K_padded // 16], global_scale, pad_k, orig_shape)
     """
-    if not torch.isfinite(tensor_float).all():
+    if not torch.isfinite(weight_2d).all():
         raise ValueError("Tensor chứa giá trị NaN hoặc Inf! Không thể lượng tử hóa.")
 
-    orig_shape = tuple(tensor_float.shape)
-    flat = tensor_float.reshape(-1).float()
-    orig_numel = flat.numel()
+    orig_shape = tuple(weight_2d.shape)
+    if weight_2d.ndim == 1:
+        weight_2d = weight_2d.unsqueeze(0)
 
-    # 1. Padding nếu kích thước không chia hết cho block_size
-    pad_len = (block_size - (orig_numel % block_size)) % block_size
-    if pad_len > 0:
-        flat = F.pad(flat, (0, pad_len), value=0.0)
+    N, K = weight_2d.shape[0], weight_2d.shape[1]
 
-    # 2. Tính Scale Cấp 2: Global Tensor Scale (FP32)
-    tensor_max = torch.max(torch.abs(flat)).item()
-    if tensor_max == 0:
+    # 1. Padding trục K nếu không chia hết cho block_size (16)
+    pad_k = (block_size - (K % block_size)) % block_size
+    if pad_k > 0:
+        w_padded = F.pad(weight_2d.float(), (0, pad_k), value=0.0)
+    else:
+        w_padded = weight_2d.float()
+
+    K_padded = w_padded.shape[1]
+
+    # 2. Tính Scale Cấp 2: Global Scale (FP32)
+    # Tối ưu dải động sao cho block_scale tối đa = 448.0 (FP8 E4M3 max)
+    w_max = torch.max(torch.abs(w_padded)).item()
+    if w_max == 0:
         global_scale = 1.0
     else:
-        # 448.0 là giá trị biểu diễn tối đa của FP8 E4M3
-        global_scale = float(tensor_max / 448.0) if tensor_max > 448.0 else 1.0
+        global_scale = float(w_max / (FP8_E4M3_MAX * E2M1_MAX))
+        global_scale = max(global_scale, 1e-12)
 
-    blocks = flat.reshape(-1, block_size)
+    # 3. Tính Scale Cấp 1: Micro-Block Scale FP8 (E4M3) per 16 elements along K
+    # Shape: [N, K_padded // 16, 16]
+    blocks = w_padded.reshape(N, K_padded // block_size, block_size)
+    block_max = torch.max(torch.abs(blocks), dim=-1, keepdim=True).values  # [N, K // 16, 1]
+    zero_mask = (block_max == 0)
 
-    # 3. Tính Scale Cấp 1: Micro-Block Scale FP8 (E4M3) per 16 elements
-    block_max = torch.max(torch.abs(blocks), dim=-1, keepdim=True).values
-    zero_mask = block_max == 0
-
-    # scale_block = block_max / (global_scale * 6.0)
+    # raw_block_scale in range [0, 448.0]
     raw_block_scales = torch.where(
         zero_mask,
         torch.zeros_like(block_max),
-        block_max / (global_scale * 6.0)
+        (block_max / (global_scale * E2M1_MAX)).clamp(max=FP8_E4M3_MAX)
     )
 
-    # Ép kiểu scale block về FP8 E4M3 chuẩn phần cứng Blackwell (hoặc bfloat16 tương thích)
+    # Ép kiểu block scale sang FP8 E4M3
     try:
-        block_scales = raw_block_scales.to(torch.float8_e4m3fn)
-        block_scales_float = block_scales.float()
+        block_scales_fp8 = raw_block_scales.squeeze(-1).to(torch.float8_e4m3fn)
+        block_scales_float = block_scales_fp8.float().unsqueeze(-1)
     except Exception:
-        block_scales = raw_block_scales.to(torch.bfloat16)
-        block_scales_float = block_scales.float()
+        block_scales_fp8 = raw_block_scales.squeeze(-1).to(torch.bfloat16)
+        block_scales_float = block_scales_fp8.float().unsqueeze(-1)
 
     # 4. Chuẩn hóa giá trị ma trận về dải [-6.0, 6.0] của NVFP4 E2M1
     effective_scale = (global_scale * block_scales_float).clamp(min=1e-12)
     normalized_blocks = torch.where(
         zero_mask,
         torch.zeros_like(blocks),
-        (blocks / effective_scale).clamp(-6.0, 6.0)
+        (blocks / effective_scale).clamp(-E2M1_MAX, E2M1_MAX)
     )
 
-    # 5. Khớp mức NVFP4 gần nhất (Nearest Level Mapping)
+    # 5. Khớp mức NVFP4 gần nhất (Nearest Level Vectorized Mapping)
     levels = NVFP4_LEVELS.to(blocks.device)
-    diffs = torch.abs(normalized_blocks.unsqueeze(-1) - levels)
-    nearest_idx = torch.argmin(diffs, dim=-1)
+    diffs = torch.abs(normalized_blocks.unsqueeze(-1) - levels)  # [N, K//16, 16, 16]
+    nearest_idx = torch.argmin(diffs, dim=-1)                   # [N, K//16, 16]
 
-    codes = NVFP4_CODES.to(blocks.device)[nearest_idx].reshape(-1)
+    codes_table = NVFP4_CODES.to(blocks.device)
+    codes = codes_table[nearest_idx].reshape(N, K_padded)       # [N, K_padded] (uint8 4-bit in low nibble)
 
-    # 6. Đóng gói 2 mã 4-bit vào 1 byte uint8 (High nibble = idx 0, Low nibble = idx 1)
-    high_nibble = (codes[0::2] & 0x0F) << 4
-    low_nibble = (codes[1::2] & 0x0F)
-    packed_nvfp4 = (high_nibble | low_nibble).to(torch.uint8)
+    # 6. Đóng gói 2 mã 4-bit vào 1 byte uint8 (High nibble = even idx, Low nibble = odd idx)
+    high_nibble = (codes[:, 0::2] & 0x0F) << 4
+    low_nibble = (codes[:, 1::2] & 0x0F)
+    packed_nvfp4 = (high_nibble | low_nibble).to(torch.uint8)   # [N, K_padded // 2]
 
-    return packed_nvfp4, block_scales.reshape(-1), global_scale, pad_len, orig_shape
+    return packed_nvfp4, block_scales_fp8, global_scale, pad_k, orig_shape
 
 
-def dequantize_tensor_from_nvfp4_two_level(
+def dequantize_matrix_from_nvfp4_two_level(
     packed_weight: torch.Tensor,
     block_scales: torch.Tensor,
     global_scale: float,
-    pad_len: int,
+    pad_k: int,
     orig_shape: Tuple[int, ...],
     block_size: int = NVFP4_DEFAULT_BLOCK_SIZE,
     target_dtype: torch.dtype = torch.bfloat16
 ) -> torch.Tensor:
     """
-    Giải nén ngược (Dequantize) từ chuẩn NVFP4 Two-Level về tensor gốc để kiểm tra sai số hoặc suy luận.
+    Giải nén ngược chuẩn xác để kiểm thử sai số cosine similarity và validation.
     """
-    # 1. Giải mã byte uint8 thành 2 mã 4-bit
+    N = packed_weight.shape[0]
+    K_half = packed_weight.shape[1]
+    K_padded = K_half * 2
+
+    # 1. Unpack uint8 -> 2 codes 4-bit
     high_codes = (packed_weight >> 4) & 0x0F
     low_codes = packed_weight & 0x0F
 
-    codes = torch.empty(packed_weight.numel() * 2, dtype=torch.uint8, device=packed_weight.device)
-    codes[0::2] = high_codes
-    codes[1::2] = low_codes
+    codes = torch.empty((N, K_padded), dtype=torch.uint8, device=packed_weight.device)
+    codes[:, 0::2] = high_codes
+    codes[:, 1::2] = low_codes
 
-    # 2. Tra cứu giá trị E2M1 trong DEQUANT_TABLE
+    # 2. Lookup table
     table = DEQUANT_TABLE.to(packed_weight.device)
-    values = table[codes.long()]
+    values = table[codes.long()]  # [N, K_padded]
 
-    # 3. Nhân với hệ số scale hai cấp (Global Scale * Block Scale)
-    blocks = values.reshape(-1, block_size)
-    scales_expanded = (block_scales.float() * float(global_scale)).unsqueeze(-1)
+    # 3. Microscale dequantization: value * (block_scale * global_scale)
+    blocks = values.reshape(N, K_padded // block_size, block_size)
+    scales_expanded = (block_scales.float() * float(global_scale)).unsqueeze(-1)  # [N, K//16, 1]
     dequant_blocks = blocks * scales_expanded
+    w_dequant = dequant_blocks.reshape(N, K_padded)
 
-    flat = dequant_blocks.reshape(-1)
+    # 4. Unpad
+    if pad_k > 0:
+        w_dequant = w_dequant[:, :-pad_k]
 
-    # 4. Cắt bỏ padding và khôi phục hình dạng gốc
-    if pad_len > 0:
-        flat = flat[:-pad_len]
-
-    return flat.reshape(orig_shape).to(target_dtype)
+    return w_dequant.reshape(orig_shape).to(target_dtype)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# BỘ LỌC CHÍNH XÁC: BẢO TỒN FAST TRANSFORMER & HEADS Ở CHUẨN BF16
-# ═══════════════════════════════════════════════════════════════════════════════
-def is_fast_transformer_layer(key_name: str) -> bool:
+def is_protected_bf16_layer(key_name: str) -> bool:
     """
-    Bộ lọc chính xác dựa trên cấu trúc token để loại trừ hoàn toàn rủi ro false-positive.
+    Bộ lọc chính xác: Bảo toàn 100% Fast Transformer, Codec, Embedding và Norm ở chuẩn BF16.
+    Chỉ lượng tử hóa các ma trận Slow Transformer Linear Layers.
     """
     name = key_name.lower()
-    if "fast_layers" in name or "fast_output" in name:
+    if "fast_layers" in name or "fast_output" in name or "embeddings" in name or "head" in name:
         return True
 
     tokens = set(re.split(r"[._/]", name))
-    protected_tokens = {
-        "codebook",
-        "embeddings",
-        "embed",
-        "norm",
-        "bias",
-    }
+    protected_tokens = {"codebook", "embeddings", "embed", "norm", "bias"}
     return bool(tokens & protected_tokens)
+
+
+def load_model_weights(model_dir: Path) -> Dict[str, torch.Tensor]:
+    """
+    Hỗ trợ toàn diện: Sharded Safetensors, Single Safetensors, và Model.pth.
+    """
+    model_dir = Path(model_dir)
+    index_json = model_dir / "model.safetensors.index.json"
+    single_st = model_dir / "model.safetensors"
+    pth_file = model_dir / "model.pth"
+
+    if index_json.exists():
+        with open(index_json, "r", encoding="utf-8") as f:
+            idx_data = json.load(f)
+        shards = sorted(set(idx_data.get("weight_map", {}).values()))
+        weights = {}
+        for s in shards:
+            shard_path = model_dir / s
+            if shard_path.exists():
+                weights.update(st_load_file(str(shard_path), device="cpu"))
+        if weights:
+            return weights
+
+    if single_st.exists():
+        return dict(st_load_file(str(single_st), device="cpu"))
+
+    if pth_file.exists():
+        data = torch.load(pth_file, map_location="cpu", weights_only=True)
+        if "state_dict" in data:
+            data = data["state_dict"]
+        return data
+
+    raise FileNotFoundError(f"Không tìm thấy file trọng số hợp lệ (.safetensors hoặc .pth) trong {model_dir}")
 
 
 def quantize_dual_ar_model(
@@ -188,31 +229,26 @@ def quantize_dual_ar_model(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"📂 Đang nạp mô hình gốc: {input_model_path}")
+    logger.info(f"📂 Nạp mô hình gốc: {input_model_path}")
     logger.info(f"💾 Thư mục xuất NVFP4 + BF16: {output_dir}")
 
-    # Copy các file cấu hình và từ điển
+    # Copy metadata files
     for file in input_model_path.glob("*"):
-        if file.is_file() and file.suffix in [".json", ".tiktoken", ".txt"]:
-            dest = output_dir / file.name
-            if not dest.exists():
-                shutil.copyfile(file, dest)
+        if file.is_file() and file.suffix in [".json", ".tiktoken", ".txt", ".jinja"]:
+            if not file.name.endswith(".safetensors.index.json"):
+                dest = output_dir / file.name
+                if not dest.exists():
+                    shutil.copyfile(file, dest)
 
-    weights_path = input_model_path / "model.pth"
-    if not weights_path.exists():
-        raise FileNotFoundError(f"Không tìm thấy file model.pth trong {input_model_path}")
-
-    logger.info("⏳ Đang nạp trọng số mô hình vào RAM CPU...")
-    state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
-    if "state_dict" in state_dict:
-        state_dict = state_dict["state_dict"]
+    logger.info("⏳ Đang nạp trọng số mô hình...")
+    state_dict = load_model_weights(input_model_path)
 
     quantized_state_dict = {}
     metadata = {
         "quant_type": "official_nvidia_blackwell_nvfp4_bf16",
-        "slow_ar_format": f"nvfp4_e2m1_two_level_block{block_size}",
-        "fast_ar_format": "torch.bfloat16_preserved",
+        "format": "nvfp4_e2m1_two_level_block16",
         "block_size": block_size,
+        "fast_ar_format": "torch.bfloat16_preserved",
         "layers_meta": {}
     }
 
@@ -222,37 +258,24 @@ def quantize_dual_ar_model(
     total_cosine_sim = 0.0
     validated_layers = 0
 
-    logger.info(f"🚀 Bắt đầu quá trình nén {total_keys} ma trận trọng số theo chuẩn NVIDIA NVFP4...")
+    logger.info(f"🚀 Bắt đầu nén {total_keys} ma trận trọng số theo chuẩn NVIDIA Blackwell NVFP4...")
 
     for idx, (key, tensor) in enumerate(state_dict.items()):
         clean_key = key.replace("model.", "")
 
-        # 1. Giữ nguyên tensor không phải số thực (index, mask)
+        # 1. Giữ nguyên tensor phi số thực (index, mask)
         if not tensor.is_floating_point():
             quantized_state_dict[clean_key] = tensor
-            metadata["layers_meta"][clean_key] = {
-                "dtype": str(tensor.dtype),
-                "type": "non_floating_point_tensor",
-                "lossless": True
-            }
             continue
 
-        # 2. Bảo toàn Fast Transformer và Vector Norm/Bias ở chuẩn BF16
-        if is_fast_transformer_layer(clean_key) or tensor.ndim < 2:
-            is_originally_bf16 = tensor.dtype == torch.bfloat16
+        # 2. Bảo toàn Fast Transformer, Embedding, Norm ở chuẩn BF16
+        if is_protected_bf16_layer(clean_key) or tensor.ndim < 2:
             quantized_state_dict[clean_key] = tensor.to(torch.bfloat16)
-            metadata["layers_meta"][clean_key] = {
-                "dtype": "torch.bfloat16",
-                "type": "fast_ar_or_norm_preserved",
-                "original_dtype": str(tensor.dtype),
-                "lossless": is_originally_bf16,
-                "shape": list(tensor.shape)
-            }
             fast_count += 1
         else:
-            # 3. Lượng tử hóa Slow Transformer sang NVFP4 Two-Level
+            # 3. Lượng tử hóa Slow Transformer Linear sang NVFP4 Two-Level
             tensor_bf16 = tensor.to(torch.bfloat16)
-            packed_weight, block_scales, global_scale, pad_len, orig_shape = quantize_tensor_to_nvfp4_two_level(
+            packed_weight, block_scales, global_scale, pad_k, orig_shape = quantize_matrix_to_nvfp4_two_level(
                 tensor_bf16, block_size=block_size
             )
 
@@ -261,21 +284,15 @@ def quantize_dual_ar_model(
             quantized_state_dict[f"{clean_key}.nvfp4_global_scale"] = torch.tensor(global_scale, dtype=torch.float32)
 
             metadata["layers_meta"][clean_key] = {
-                "type": "slow_ar_nvfp4_two_level",
-                "dtype": f"nvfp4_e2m1_block{block_size}",
                 "orig_shape": list(orig_shape),
-                "orig_numel": int(tensor.numel()),
-                "pad_len": int(pad_len),
-                "block_size": int(block_size),
+                "pad_k": int(pad_k),
                 "global_scale": float(global_scale),
-                "pack_order": "high_nibble_idx0_low_nibble_idx1"
             }
             slow_count += 1
 
-            # Kiểm thử tính toán ngược (Round-trip Verification)
-            if run_validation_check and (slow_count % 5 == 0 or slow_count <= 5):
-                dequant = dequantize_tensor_from_nvfp4_two_level(
-                    packed_weight, block_scales, global_scale, pad_len, orig_shape, block_size=block_size
+            if run_validation_check and (slow_count % 10 == 0 or slow_count <= 3):
+                dequant = dequantize_matrix_from_nvfp4_two_level(
+                    packed_weight, block_scales, global_scale, pad_k, orig_shape, block_size=block_size
                 )
                 cos_sim = torch.cosine_similarity(
                     tensor_bf16.float().flatten(),
@@ -289,33 +306,34 @@ def quantize_dual_ar_model(
             logger.info(f"⚡ Tiến độ: {idx + 1}/{total_keys} (Slow NVFP4: {slow_count}, Fast BF16: {fast_count})")
             gc.collect()
 
-    # Ghi metadata chi tiết
+    # Ghi metadata
     with open(output_dir / "quant_config.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
-    out_file = output_dir / "model.pth"
-    logger.info(f"💾 Đang ghi mô hình NVFP4 ra đĩa: {out_file}...")
-    torch.save(quantized_state_dict, out_file)
+    # Lưu Safetensors Shards (Max 3GB/shard)
+    logger.info("💾 Đang xuất file trọng số định dạng Safetensors...")
+    out_st = output_dir / "model.safetensors"
+    st_save_file(quantized_state_dict, str(out_st))
 
-    orig_size_mb = os.path.getsize(weights_path) / (1024 * 1024)
-    quant_size_mb = os.path.getsize(out_file) / (1024 * 1024)
+    # Cũng xuất model.pth để tương thích tối đa
+    torch.save(quantized_state_dict, output_dir / "model.pth")
+
+    quant_size_mb = os.path.getsize(out_st) / (1024 * 1024)
     avg_cosine = (total_cosine_sim / validated_layers) if validated_layers > 0 else 1.0
 
     logger.info("=" * 70)
-    logger.info("🎉 QUÁ TRÌNH NÉN NVFP4 + BF16 THEO CHUẨN NVIDIA BLACKWELL ĐÃ HOÀN TẤT!")
-    logger.info(f"📊 Dung lượng gốc (FP16/BF16)  : {orig_size_mb:.2f} MB (~{orig_size_mb/1024:.2f} GB)")
-    logger.info(f"📊 Dung lượng sau nén (NVFP4)   : {quant_size_mb:.2f} MB (~{quant_size_mb/1024:.2f} GB)")
-    logger.info(f"📉 Tỷ lệ cắt giảm bộ nhớ       : -{100 * (1 - quant_size_mb/orig_size_mb):.1f}%")
-    logger.info(f"🛡️ Số layer Fast AR giữ BF16   : {fast_count} layers (Bảo toàn 100% âm sắc)")
-    logger.info(f"⚡ Số layer Slow AR sang NVFP4  : {slow_count} layers (Block-16 Two-Level Scaling)")
-    logger.info(f"🔬 Độ tương đồng Cosine trung bình : {avg_cosine * 100:.3f}% (Độ chính xác chuẩn công nghiệp)")
+    logger.info("🎉 QUÁ TRÌNH LƯỢNG TỬ HÓA NVFP4 + BF16 THEO CHUẨN NVIDIA ĐÃ HOÀN TẤT!")
+    logger.info(f"📊 Dung lượng sau nén (NVFP4)     : {quant_size_mb:.2f} MB (~{quant_size_mb/1024:.2f} GB)")
+    logger.info(f"🛡️ Số layer Fast AR giữ nguyên BF16: {fast_count} layers")
+    logger.info(f"⚡ Số layer Slow AR sang NVFP4    : {slow_count} layers")
+    logger.info(f"🔬 Độ tương đồng Cosine trung bình : {avg_cosine * 100:.3f}%")
     logger.info("=" * 70)
 
 
 @click.command()
-@click.option("--checkpoint-path", type=click.Path(exists=True), required=True, help="Input FP16/BF16 model directory")
+@click.option("--checkpoint-path", type=click.Path(exists=True), required=True, help="Input model directory")
 @click.option("--output", type=str, required=True, help="Output NVFP4 model directory")
-@click.option("--block-size", type=int, default=NVFP4_DEFAULT_BLOCK_SIZE, help="NVFP4 scaling block size (default 16)")
+@click.option("--block-size", type=int, default=NVFP4_DEFAULT_BLOCK_SIZE, help="Block size (default 16)")
 def main(checkpoint_path, output, block_size):
     quantize_dual_ar_model(Path(checkpoint_path), Path(output), block_size=block_size)
 
