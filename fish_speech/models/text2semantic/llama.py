@@ -826,25 +826,18 @@ class DualARTransformer(BaseTransformer):
         flat_x = self.fast_project_in(x).view(bsz * seqlen, -1)
         flat_codebooks = codebooks.reshape(bsz * seqlen, -1)
 
-        # Micro-chunking Fast Transformer (chunk_size=128) with static shapes
-        total_tokens = flat_x.size(0)
-        chunk_size = 128
-        fast_chunks = []
-        for start_idx in range(0, total_tokens, chunk_size):
-            x_sub = flat_x[start_idx : start_idx + chunk_size]
-            cb_sub = flat_codebooks[start_idx : start_idx + chunk_size]
-            cb_sub_safe = torch.clamp(cb_sub, min=0, max=self.config.codebook_size - 1)
-            cb_embed_sub = self.fast_embeddings(cb_sub_safe)
-            x_c = torch.cat([x_sub[:, None], cb_embed_sub], dim=1)
+        # Fast Transformer in single vectorized pass (eliminates 60 unrolled layer subgraphs)
+        cb_sub_safe = torch.clamp(flat_codebooks, min=0, max=self.config.codebook_size - 1)
+        cb_embed = self.fast_embeddings(cb_sub_safe)
+        x_c = torch.cat([flat_x[:, None], cb_embed], dim=1)
 
-            for layer in self.fast_layers:
-                if self.config.use_gradient_checkpointing and self.training:
-                    x_c = checkpoint(layer, x_c, fast_freqs_cis, fast_mask, use_reentrant=False)
-                else:
-                    x_c = layer(x_c, fast_freqs_cis, fast_mask)
-            fast_chunks.append(x_c)
+        for layer in self.fast_layers:
+            if self.config.use_gradient_checkpointing and self.training:
+                x_c = checkpoint(layer, x_c, fast_freqs_cis, fast_mask, use_reentrant=False)
+            else:
+                x_c = layer(x_c, fast_freqs_cis, fast_mask)
 
-        fast_out = self.fast_norm(torch.cat(fast_chunks, dim=0))
+        fast_out = self.fast_norm(x_c)
 
         if self.training:
             # Skip materializing codebook_logits tensor during training
@@ -1059,17 +1052,14 @@ class FeedForward(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-5):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x):
-        return x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
-
     def forward(self, x: Tensor) -> Tensor:
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        variance = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(variance + self.eps) * self.weight
 
 
 def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000) -> Tensor:

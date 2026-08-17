@@ -125,7 +125,7 @@ class TextToSemantic(L.LightningModule):
             hidden_states=outputs.hidden_states,
             lm_head=lm_head,
             labels=labels[:, 0],
-            chunk_size=128,
+            chunk_size=256,
         )
 
         # 2. Vectorized Semantic Loss (Codebook vocab is only 4096, 160 MB total - eliminates 3.2 GB XLA slice pad buffers)
