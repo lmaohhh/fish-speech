@@ -377,17 +377,11 @@ class BaseTransformer(nn.Module):
             atten_mask = atten_mask.logical_not()
             mask = causal & atten_mask
 
-        def run_layer_block(block_layers, h, freqs, m):
-            for l in block_layers:
-                h = l(h, freqs, m)
-            return h
-
-        for i in range(0, len(self.layers), 2):
-            block_layers = self.layers[i : i + 2]
+        for layer in self.layers:
             if self.config.use_gradient_checkpointing and self.training:
-                x = checkpoint(run_layer_block, block_layers, x, freqs_cis, mask, use_reentrant=True)
+                x = checkpoint(layer, x, freqs_cis, mask, use_reentrant=True)
             else:
-                x = run_layer_block(block_layers, x, freqs_cis, mask)
+                x = layer(x, freqs_cis, mask)
 
         slow_out = self.norm(x)
 
@@ -875,13 +869,12 @@ class DualARTransformer(BaseTransformer):
         if self.training and x.size(0) > 512:
             out_fast = torch.empty_like(x)
             chunk_size = 512
-        # Fast layers checkpointing
-        for i in range(0, len(self.fast_layers), 2):
-            block_layers = self.fast_layers[i : i + 2]
+        # Fast layers checkpointing (per layer)
+        for layer in self.fast_layers:
             if self.config.use_gradient_checkpointing and self.training:
-                x = checkpoint(run_fast_transformer, block_layers, x, fast_freqs_cis, fast_mask, use_reentrant=True)
+                x = checkpoint(layer, x, fast_freqs_cis, fast_mask, use_reentrant=True)
             else:
-                x = run_fast_transformer(block_layers, x, fast_freqs_cis, fast_mask)
+                x = layer(x, fast_freqs_cis, fast_mask)
 
         # unflatten the batch and num_codebooks
         fast_out = self.fast_norm(x)

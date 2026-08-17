@@ -1,4 +1,4 @@
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import lightning as L
 import torch
@@ -12,6 +12,43 @@ CODEBOOK_PAD_TOKEN_ID = 0
 from fish_speech.models.text2semantic.llama import NaiveTransformer
 
 log = utils.RankedLogger(__name__, rank_zero_only=True)
+
+
+def compute_chunked_base_loss(hidden_states, lm_head, labels, chunk_size: int = 256):
+    """
+    Computes cross-entropy loss in token chunks without host-device synchronization barriers.
+    Keeps logits memory strictly under 76 MB to fit within TPU 16GB HBM.
+    """
+    flat_h = hidden_states.reshape(-1, hidden_states.size(-1))
+    flat_targets = labels.reshape(-1)
+
+    total_valid = (flat_targets != -100).sum()
+    total_loss = torch.tensor(0.0, device=hidden_states.device, dtype=torch.float32)
+    num_tokens = flat_h.size(0)
+
+    for start in range(0, num_tokens, chunk_size):
+        end = min(start + chunk_size, num_tokens)
+        chunk_h = flat_h[start:end]
+        chunk_targets = flat_targets[start:end]
+
+        if isinstance(lm_head, nn.Linear):
+            chunk_logits = lm_head(chunk_h)
+        elif isinstance(lm_head, nn.Embedding):
+            chunk_logits = F.linear(chunk_h, lm_head.weight)
+        elif isinstance(lm_head, torch.Tensor):
+            chunk_logits = F.linear(chunk_h, lm_head)
+        else:
+            chunk_logits = F.linear(chunk_h, lm_head.weight)
+
+        chunk_loss = F.cross_entropy(
+            chunk_logits.float(),
+            chunk_targets,
+            ignore_index=-100,
+            reduction="sum",
+        )
+        total_loss = total_loss + chunk_loss
+
+    return total_loss / torch.clamp(total_valid.float(), min=1.0)
 
 
 class TextToSemantic(L.LightningModule):
@@ -66,17 +103,6 @@ class TextToSemantic(L.LightningModule):
             },
         }
 
-    def configure_gradient_clipping(
-        self,
-        optimizer,
-        gradient_clip_val: Optional[Union[int, float]] = None,
-        gradient_clip_algorithm: Optional[str] = None,
-    ):
-        if gradient_clip_val is None or gradient_clip_val <= 0:
-            return
-        trainable_params = [p for p in self.parameters() if p.requires_grad]
-        torch.nn.utils.clip_grad_norm_(trainable_params, float(gradient_clip_val))
-
     def _step(self, batch, batch_idx, stage: str = "train"):
         is_train = stage == "train"
         if is_train:
@@ -89,28 +115,20 @@ class TextToSemantic(L.LightningModule):
             labels=batch["labels"],
         )
 
-        # 1. Direct Vectorized Base Loss (Zero Python loops, Native TPU MXU acceleration)
+        # 1. Chunked Base Loss (Keeps intermediate logits under 76 MB)
         lm_head = (
             self.model.embeddings
             if self.model.config.tie_word_embeddings
             else self.model.output
         )
-        if isinstance(lm_head, nn.Embedding):
-            base_logits = F.linear(outputs.hidden_states, lm_head.weight)
-        elif isinstance(lm_head, nn.Linear):
-            base_logits = lm_head(outputs.hidden_states)
-        elif isinstance(lm_head, torch.Tensor):
-            base_logits = F.linear(outputs.hidden_states, lm_head)
-        else:
-            base_logits = F.linear(outputs.hidden_states, lm_head.weight)
-
-        base_loss = F.cross_entropy(
-            base_logits.view(-1, base_logits.size(-1)).float(),
-            labels[:, 0].reshape(-1),
-            ignore_index=-100,
+        base_loss = compute_chunked_base_loss(
+            hidden_states=outputs.hidden_states,
+            lm_head=lm_head,
+            labels=labels[:, 0],
+            chunk_size=256,
         )
 
-        # 2. Direct Vectorized Semantic Loss
+        # 2. Vectorized Semantic Loss (Codebook vocab is only 4096, 8 MB total)
         token_ids = labels[:, 0]
         semantic_mask = (token_ids >= self.model.tokenizer.semantic_begin_id) & (
             token_ids <= self.model.tokenizer.semantic_end_id
@@ -170,7 +188,7 @@ class TextToSemantic(L.LightningModule):
             sync_dist=not is_train,
         )
 
-        # 3. Vectorized Top-5 Accuracy (Single operation without slice loops)
+        # 3. Vectorized Top-5 Accuracy (Only during validation to keep training fast)
         if not is_train and outputs.fast_hidden_states is not None:
             accuracy = self.get_vectorized_accuracy(fast_logits, filtered_codebook_labels)
             self.log(
