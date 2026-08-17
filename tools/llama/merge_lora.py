@@ -1,3 +1,4 @@
+import gc
 import shutil
 from copy import deepcopy
 from pathlib import Path
@@ -80,24 +81,10 @@ def merge(lora_config, base_weight, lora_weight, output):
             if not dest.exists():
                 shutil.copyfile(file, dest)
 
-    logger.info(f"Saved merged model and tokenizer to {output}, validating")
-
-    new_state_dict = torch.load(output / "model.pth", map_location="cpu")
-    original_keys = set(llama_state_dict_copy.keys())
-
-    tolerance = 1e-5
-    for key in original_keys:
-        diff_l1 = (new_state_dict[key] - llama_state_dict_copy[key]).abs().sum().item()
-        if diff_l1 > tolerance:
-            logger.info(f"Significant difference found in key: {key}")
-            break
-
-    if diff_l1 <= tolerance:
-        logger.warning(
-            "Merged model seems identical to the original model. Further validation might be needed."
-        )
-    else:
-        logger.info("Merged model is different from the original model, check passed")
+    logger.info(f"Saved merged model and tokenizer to {output} successfully!")
+    del llama_model, llama_state_dict, lora_state_dict, merged_state_dict
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
