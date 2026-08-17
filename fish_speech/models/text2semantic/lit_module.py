@@ -158,7 +158,7 @@ class TextToSemantic(L.LightningModule):
             on_epoch=not is_train,
             prog_bar=False,
             logger=True,
-            sync_dist=not is_train,
+            sync_dist=False,
         )
 
         self.log(
@@ -177,7 +177,7 @@ class TextToSemantic(L.LightningModule):
             on_epoch=not is_train,
             prog_bar=False,
             logger=True,
-            sync_dist=not is_train,
+            sync_dist=False,
         )
 
         self.log(
@@ -187,8 +187,18 @@ class TextToSemantic(L.LightningModule):
             on_epoch=not is_train,
             prog_bar=False,
             logger=True,
-            sync_dist=not is_train,
+            sync_dist=False,
         )
+
+        # Real-time console progress output on Rank 0 every 10 steps
+        if is_train and getattr(self, "global_rank", 0) == 0 and (self.global_step % 10 == 0 or self.global_step == 1):
+            try:
+                print(
+                    f"⚡ [Step {self.global_step:03d}/{getattr(self.trainer, 'max_steps', 800)}] Total Loss: {loss.detach().item():.4f} (Base: {base_loss.detach().item():.4f}, Semantic: {semantic_loss.detach().item():.4f})",
+                    flush=True,
+                )
+            except Exception:
+                pass
 
         # 3. Vectorized Top-5 Accuracy (Only during validation)
         if not is_train and outputs.fast_hidden_states is not None:
