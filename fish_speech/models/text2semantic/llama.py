@@ -595,13 +595,16 @@ class BaseTransformer(nn.Module):
                 for shard_path in shard_files:
                     all_weights.update(st_load_file(str(shard_path), device=_load_device))
 
+                prefixes = ["text_model.model.", "text_model.", "base_model.model.", "base_model.", "model."]
                 cleaned_weights = {}
                 for k, v in all_weights.items():
-                    k_clean = k
-                    if k_clean.startswith("model."):
-                        k_clean = k_clean.replace("model.", "")
-                    if "audio_" in k_clean:
+                    if "audio_" in k:
                         continue
+                    k_clean = k
+                    for p in prefixes:
+                        if k_clean.startswith(p):
+                            k_clean = k_clean[len(p):]
+                            break
                     cleaned_weights[k_clean] = v
 
                 err = model.load_state_dict(cleaned_weights, strict=False, assign=True)
