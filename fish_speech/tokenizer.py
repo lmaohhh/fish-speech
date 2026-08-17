@@ -122,8 +122,13 @@ class FishTokenizer:
         self._tokenizer.save_pretrained(path)
 
     @classmethod
-    def from_pretrained(cls, path: str):
-        return cls(path)
+    def __getstate__(self):
+        return self.__dict__
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
 
     def __getattr__(self, name):
+        if name == "_tokenizer" or "_tokenizer" not in self.__dict__:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
         return getattr(self._tokenizer, name)
