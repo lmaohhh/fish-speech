@@ -68,10 +68,11 @@ def merge(lora_config, base_weight, lora_weight, output):
 
     merged_state_dict = llama_state_dict | lora_state_dict
     llama_model.load_state_dict(merged_state_dict, strict=True)
-    logger.info(f"Merged model loaded")
+    logger.info(f"Merged model loaded in memory")
 
     # Trigger eval mode to merge lora
     llama_model.eval()
+    logger.info(f"⏳ Đang ghi mô hình 4.6B ra đĩa ({output}/model.pth)... Vui lòng đợi khoảng 20-30 giây...")
     llama_model.save_pretrained(output, drop_lora=True)
 
     # Copy tokenizer and config files to output directory
@@ -81,7 +82,7 @@ def merge(lora_config, base_weight, lora_weight, output):
             if not dest.exists():
                 shutil.copyfile(file, dest)
 
-    logger.info(f"Saved merged model and tokenizer to {output} successfully!")
+    logger.info(f"🎉 Ghi xong 100% mô hình và tokenizer vào {output}!")
     del llama_model, llama_state_dict, lora_state_dict, merged_state_dict
     gc.collect()
     torch.cuda.empty_cache()
