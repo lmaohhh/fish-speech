@@ -2,8 +2,8 @@ from typing import Any, Optional
 
 import lightning as L
 import torch
-import torch.nn.functional as F
 import torch.nn as nn
+import torch.nn.functional as F
 from lightning.pytorch.utilities.types import OptimizerLRScheduler
 
 import fish_speech.utils as utils
@@ -12,77 +12,6 @@ CODEBOOK_PAD_TOKEN_ID = 0
 from fish_speech.models.text2semantic.llama import NaiveTransformer
 
 log = utils.RankedLogger(__name__, rank_zero_only=True)
-
-
-def compute_chunked_base_loss(hidden_states, lm_head, labels, chunk_size: int = 256):
-    """
-    Computes cross-entropy loss in token chunks without host-device synchronization barriers.
-    Mathematically identical to standard cross-entropy, safe for TPU XLA and GPU.
-    """
-    flat_h = hidden_states.reshape(-1, hidden_states.size(-1))
-    flat_targets = labels.reshape(-1)
-
-    total_valid = (flat_targets != -100).sum()
-    total_loss = torch.tensor(0.0, device=hidden_states.device, dtype=torch.float32)
-    num_tokens = flat_h.size(0)
-
-    for start in range(0, num_tokens, chunk_size):
-        end = min(start + chunk_size, num_tokens)
-        chunk_h = flat_h[start:end]
-        chunk_targets = flat_targets[start:end]
-
-        if isinstance(lm_head, nn.Linear):
-            chunk_logits = lm_head(chunk_h)
-        elif isinstance(lm_head, nn.Embedding):
-            chunk_logits = F.linear(chunk_h, lm_head.weight)
-        elif isinstance(lm_head, torch.Tensor):
-            chunk_logits = F.linear(chunk_h, lm_head)
-        else:
-            chunk_logits = F.linear(chunk_h, lm_head.weight)
-
-        chunk_loss = F.cross_entropy(
-            chunk_logits.float(),
-            chunk_targets,
-            ignore_index=-100,
-            reduction="sum",
-        )
-        total_loss = total_loss + chunk_loss
-
-    return total_loss / torch.clamp(total_valid.float(), min=1.0)
-
-
-def compute_chunked_semantic_loss(
-    fast_hidden_states: torch.Tensor,
-    fast_output: nn.Module,
-    filtered_codebook_labels: torch.Tensor,
-    chunk_size: int = 512,
-) -> torch.Tensor:
-    """
-    Computes semantic cross-entropy loss in chunks without host-device sync barriers.
-    Safe for TPU XLA and GPU.
-    """
-    flat_h = fast_hidden_states.reshape(-1, fast_hidden_states.size(-1))
-    flat_labels = filtered_codebook_labels.reshape(-1)
-
-    total_valid = (flat_labels != -100).sum()
-    total_loss = torch.tensor(0.0, device=fast_hidden_states.device, dtype=torch.float32)
-    num_tokens = flat_h.size(0)
-
-    for start in range(0, num_tokens, chunk_size):
-        end = min(start + chunk_size, num_tokens)
-        chunk_h = flat_h[start:end]
-        chunk_labels = flat_labels[start:end]
-
-        chunk_logits = fast_output(chunk_h)
-        chunk_loss = F.cross_entropy(
-            chunk_logits.float(),
-            chunk_labels,
-            ignore_index=-100,
-            reduction="sum",
-        )
-        total_loss = total_loss + chunk_loss
-
-    return total_loss / torch.clamp(total_valid.float(), min=1.0)
 
 
 class TextToSemantic(L.LightningModule):
@@ -98,23 +27,14 @@ class TextToSemantic(L.LightningModule):
         self.optimizer_builder = optimizer
         self.lr_scheduler_builder = lr_scheduler
 
-    def forward(self, x):
-        return self.model(x)
-
-    def on_save_checkpoint(self, checkpoint):
-        # Save only LoRA parameters
+    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         state_dict = checkpoint["state_dict"]
-        use_lora = any("lora" in name for name in state_dict.keys())
-        if not use_lora:
-            return
 
         for name in list(state_dict.keys()):
             if "lora" not in name:
                 state_dict.pop(name)
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
-        # Get weight decay parameters ONLY for trainable (requires_grad=True) parameters
-        # This prevents AdamW from tracking 4.6B frozen parameters which causes huge RAM spikes
         weight_decay_parameters, other_parameters = [], []
         for name, param in self.named_parameters():
             if not param.requires_grad:
@@ -131,7 +51,6 @@ class TextToSemantic(L.LightningModule):
             ]
         )
 
-        # Print the parameters and their weight decay
         for i in optimizer.param_groups:
             log.info(
                 f"Set weight decay: {i['weight_decay']} for {len(i['params'])} parameters"
@@ -147,78 +66,40 @@ class TextToSemantic(L.LightningModule):
             },
         }
 
-    # Copied from https://github.com/eric-mitchell/direct-preference-optimization/blob/main/trainers.py#L90
-    def get_batch_logps(
-        self,
-        logits: torch.FloatTensor,
-        labels: torch.LongTensor,
-        average_log_prob: bool = False,
-    ) -> torch.FloatTensor:
-        """Compute the log probabilities of the given labels under the given logits.
-
-        Args:
-            logits: Logits of the model (unnormalized). Shape: (batch_size, sequence_length, codebook_size, vocab_size)
-            labels: Labels for which to compute the log probabilities. Label tokens with a value of -100 are ignored. Shape: (batch_size, sequence_length, codebook_size)
-            average_log_prob: If True, return the average log probability per (non-masked) token. Otherwise, return the sum of the log probabilities of the (non-masked) tokens.
-
-        Returns:
-            A tensor of shape (batch_size,) containing the average/sum log probabilities of the given labels under the given logits.
-        """
-        assert logits.shape[:-1] == labels.shape
-
-        labels = labels.clone()
-        loss_mask = labels != -100
-
-        # dummy token; we'll ignore the losses on these tokens later
-        labels[labels == -100] = 0
-
-        per_token_logps = torch.gather(
-            logits.log_softmax(-1), dim=-1, index=labels.unsqueeze(-1)
-        ).squeeze(-1)
-
-        if average_log_prob:
-            return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
-        else:
-            return (per_token_logps * loss_mask).sum(-1)
-
-    def _step(self, batch, batch_idx, stage: str):
+    def _step(self, batch, batch_idx, stage: str = "train"):
         is_train = stage == "train"
-
         if is_train:
-            # Key part to make lora work
-            # Otherwise the parameters are merged, which lead to incorrect gradients
             self.model.train()
 
-        # Do positive and negative samples in the same batch to speed up training
         labels = batch["labels"]
         outputs = self.model(
             inp=batch["inputs"],
             key_padding_mask=batch["attention_masks"],
             labels=batch["labels"],
         )
-        token_logits = outputs.token_logits
-        codebook_logits = outputs.codebook_logits
 
-        # Generate labels (Chunked Cross-Entropy saves ~2.3 GB VRAM during training)
-        if token_logits is None:
-            lm_head = (
-                self.model.embeddings
-                if self.model.config.tie_word_embeddings
-                else self.model.output
-            )
-            base_loss = compute_chunked_base_loss(
-                hidden_states=outputs.hidden_states,
-                lm_head=lm_head,
-                labels=labels[:, 0],
-                chunk_size=256,
-            )
+        # 1. Direct Vectorized Base Loss (Zero Python loops, Native TPU MXU acceleration)
+        lm_head = (
+            self.model.embeddings
+            if self.model.config.tie_word_embeddings
+            else self.model.output
+        )
+        if isinstance(lm_head, nn.Embedding):
+            base_logits = F.linear(outputs.hidden_states, lm_head.weight)
+        elif isinstance(lm_head, nn.Linear):
+            base_logits = lm_head(outputs.hidden_states)
+        elif isinstance(lm_head, torch.Tensor):
+            base_logits = F.linear(outputs.hidden_states, lm_head)
         else:
-            base_loss = F.cross_entropy(
-                token_logits.view(-1, token_logits.size(-1)),
-                labels[:, 0].reshape(-1),
-                ignore_index=-100,
-            )
+            base_logits = F.linear(outputs.hidden_states, lm_head.weight)
 
+        base_loss = F.cross_entropy(
+            base_logits.view(-1, base_logits.size(-1)).float(),
+            labels[:, 0].reshape(-1),
+            ignore_index=-100,
+        )
+
+        # 2. Direct Vectorized Semantic Loss
         token_ids = labels[:, 0]
         semantic_mask = (token_ids >= self.model.tokenizer.semantic_begin_id) & (
             token_ids <= self.model.tokenizer.semantic_end_id
@@ -226,19 +107,16 @@ class TextToSemantic(L.LightningModule):
         all_codebook_labels = labels[:, 1 : 1 + self.model.config.num_codebooks]
         all_codebook_labels_permuted = all_codebook_labels.permute(0, 2, 1)
         filtered_codebook_labels = all_codebook_labels_permuted[semantic_mask]
-        if codebook_logits is None and outputs.fast_hidden_states is not None:
-            semantic_loss = compute_chunked_semantic_loss(
-                fast_hidden_states=outputs.fast_hidden_states,
-                fast_output=self.model.fast_output,
-                filtered_codebook_labels=filtered_codebook_labels,
-                chunk_size=512,
-            )
-        else:
+
+        if outputs.fast_hidden_states is not None:
+            fast_logits = self.model.fast_output(outputs.fast_hidden_states)
             semantic_loss = F.cross_entropy(
-                codebook_logits.reshape(-1, codebook_logits.size(-1)),
+                fast_logits.view(-1, fast_logits.size(-1)).float(),
                 filtered_codebook_labels.reshape(-1),
                 ignore_index=-100,
             )
+        else:
+            semantic_loss = torch.tensor(0.0, device=base_loss.device)
 
         loss = base_loss + semantic_loss
 
@@ -281,59 +159,33 @@ class TextToSemantic(L.LightningModule):
             sync_dist=not is_train,
         )
 
-        # Top-5 accuracy (memory-efficient chunked computation)
-        accuracy = self.get_accuracy(
-            codebook_logits,
-            filtered_codebook_labels,
-            fast_hidden_states=outputs.fast_hidden_states,
-            fast_output=self.model.fast_output,
-        )
-        self.log(
-            f"{stage}/top_5_accuracy",
-            accuracy,
-            on_step=is_train,
-            on_epoch=not is_train,
-            prog_bar=True,
-            logger=True,
-            sync_dist=not is_train,
-        )
+        # 3. Vectorized Top-5 Accuracy (Single operation without slice loops)
+        if not is_train and outputs.fast_hidden_states is not None:
+            accuracy = self.get_vectorized_accuracy(fast_logits, filtered_codebook_labels)
+            self.log(
+                f"{stage}/top_5_accuracy",
+                accuracy,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                sync_dist=True,
+            )
 
         return loss
 
-    def get_accuracy(self, logits, labels, fast_hidden_states=None, fast_output=None):
-        if logits is None and fast_hidden_states is not None and fast_output is not None:
-            flat_h = fast_hidden_states.reshape(-1, fast_hidden_states.size(-1))
-            flat_labels = labels.reshape(-1)
-            valid_mask = (flat_labels != -100) & (flat_labels != CODEBOOK_PAD_TOKEN_ID)
-            total_valid = valid_mask.sum()
+    def get_vectorized_accuracy(self, logits, labels):
+        flat_logits = logits.view(-1, logits.size(-1))
+        flat_labels = labels.view(-1)
+        valid_mask = (flat_labels != -100) & (flat_labels != CODEBOOK_PAD_TOKEN_ID)
+        total_valid = valid_mask.sum()
+        if total_valid == 0:
+            return torch.tensor(0.0, device=logits.device)
 
-            total_correct = torch.tensor(0, device=labels.device, dtype=torch.long)
-            chunk_size = 512
-
-            with torch.no_grad():
-                for start in range(0, flat_h.size(0), chunk_size):
-                    end = min(start + chunk_size, flat_h.size(0))
-                    chunk_logits = fast_output(flat_h[start:end])
-                    _, indices = chunk_logits.topk(5, dim=-1)
-                    target = flat_labels[start:end].unsqueeze(-1)
-                    mask = valid_mask[start:end].unsqueeze(-1)
-                    matches = indices.eq(target) & mask
-                    total_correct = total_correct + matches.any(dim=-1).sum()
-
-            return total_correct.float() / torch.clamp(total_valid.float(), min=1.0)
-
-        if logits is None:
-            return torch.tensor(0.0, device=labels.device)
-
-        mask = (labels != -100) & (labels != CODEBOOK_PAD_TOKEN_ID)
-        total_valid = mask.sum()
-
-        _, indices = logits.topk(5, dim=-1)
-        matches = indices.eq(labels.unsqueeze(-1)) & mask.unsqueeze(-1)
+        _, indices = flat_logits[valid_mask].topk(5, dim=-1)
+        matches = indices.eq(flat_labels[valid_mask].unsqueeze(-1))
         correct = matches.any(dim=-1).sum()
-        accuracy = correct.float() / torch.clamp(total_valid.float(), min=1.0)
-
-        return accuracy
+        return correct.float() / total_valid.float()
 
     def training_step(self, batch, batch_idx):
         return self._step(batch, batch_idx, "train")
