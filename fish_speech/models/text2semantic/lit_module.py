@@ -201,15 +201,14 @@ class TextToSemantic(L.LightningModule):
             sync_dist=not is_train,
         )
 
-        # 3. Vectorized Top-5 Accuracy (Only during validation to keep training fast)
+        # 3. Vectorized Top-5 Accuracy (Only during validation)
         if not is_train and outputs.fast_hidden_states is not None:
-            accuracy = self.get_vectorized_accuracy(fast_logits, filtered_codebook_labels)
             self.log(
-                f"{stage}/top_5_accuracy",
-                accuracy,
+                f"{stage}/loss_eval",
+                loss.detach(),
                 on_step=False,
                 on_epoch=True,
-                prog_bar=True,
+                prog_bar=False,
                 logger=True,
                 sync_dist=True,
             )
