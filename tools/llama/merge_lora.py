@@ -90,7 +90,8 @@ def merge(lora_config, base_weight, lora_weight, output):
     logger.info(f"🎉 Ghi xong 100% mô hình và tokenizer vào {output}!")
     del llama_model, llama_state_dict, lora_state_dict, merged_state_dict
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

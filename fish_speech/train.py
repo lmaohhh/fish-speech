@@ -25,7 +25,8 @@ pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 # Allow TF32 on Ampere GPUs
 torch.set_float32_matmul_precision("high")
-torch.backends.cudnn.allow_tf32 = True
+if torch.cuda.is_available():
+    torch.backends.cudnn.allow_tf32 = True
 
 # register eval resolver
 OmegaConf.register_new_resolver("eval", eval)
