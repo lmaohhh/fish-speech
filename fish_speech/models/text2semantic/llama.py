@@ -369,7 +369,7 @@ class BaseTransformer(nn.Module):
         freqs_cis = self.freqs_cis[:seq_len]
 
         mask = None
-        if key_padding_mask is not None:
+        if key_padding_mask is not None and not key_padding_mask.all():
             causal = self.causal_mask[:seq_len, :seq_len]
             causal = rearrange(causal, "q k -> 1 1 q k")
 
@@ -865,12 +865,12 @@ class DualARTransformer(BaseTransformer):
                     h = l(h, freqs, mask)
             return h
 
-        # Micro-chunking Fast Transformer (chunk_size=128)
-        # Eliminates the 177MB intermediate FFN buffers, reducing HBM usage by >4.8 GB for max_length=2048
-        if x.size(0) > 128:
+        # Micro-chunking Fast Transformer (chunk_size=64)
+        # Slices tokens into chunks of 64 to avoid XLA tile padding explosion (saves >500 MB HBM)
+        if x.size(0) > 64:
             fast_chunks = []
-            for start_idx in range(0, x.size(0), 128):
-                x_c = x[start_idx : start_idx + 128]
+            for start_idx in range(0, x.size(0), 64):
+                x_c = x[start_idx : start_idx + 64]
                 for layer in self.fast_layers:
                     if self.config.use_gradient_checkpointing and self.training:
                         x_c = checkpoint(layer, x_c, fast_freqs_cis, fast_mask, use_reentrant=True)
@@ -1031,10 +1031,6 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
-        if self.n_head > self.n_local_heads:
-            k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-            v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-
         if self.use_sdpa:
             if mask is None:
                 y = F.scaled_dot_product_attention(
@@ -1043,8 +1039,12 @@ class Attention(nn.Module):
                     v,
                     dropout_p=self.dropout if self.training else 0.0,
                     is_causal=True,
+                    enable_gqa=True if self.n_head > self.n_local_heads else False,
                 )
             else:
+                if self.n_head > self.n_local_heads:
+                    k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                    v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
                 y = F.scaled_dot_product_attention(
                     q,
                     k,
