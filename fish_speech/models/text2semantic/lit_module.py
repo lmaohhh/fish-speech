@@ -16,24 +16,13 @@ log = utils.RankedLogger(__name__, rank_zero_only=True)
 
 def compute_chunked_base_loss(hidden_states, lm_head, labels, chunk_size: int = 256):
     """
-    Computes cross-entropy loss in small token chunks to avoid materializing
-    the massive (seq_len, vocab_size) logits tensor (1.19 GB in FP16).
-    Peak memory per chunk: only ~80 MB.
-    Mathematically identical to standard cross-entropy.
+    Computes cross-entropy loss in token chunks without host-device synchronization barriers.
+    Mathematically identical to standard cross-entropy, safe for TPU XLA and GPU.
     """
     flat_h = hidden_states.reshape(-1, hidden_states.size(-1))
     flat_targets = labels.reshape(-1)
 
-    valid_mask = flat_targets != -100
-    total_valid = valid_mask.sum()
-    if total_valid == 0:
-        return torch.tensor(
-            0.0,
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-            requires_grad=True,
-        )
-
+    total_valid = (flat_targets != -100).sum()
     total_loss = torch.tensor(0.0, device=hidden_states.device, dtype=torch.float32)
     num_tokens = flat_h.size(0)
 
@@ -42,25 +31,24 @@ def compute_chunked_base_loss(hidden_states, lm_head, labels, chunk_size: int = 
         chunk_h = flat_h[start:end]
         chunk_targets = flat_targets[start:end]
 
-        if (chunk_targets != -100).any():
-            if isinstance(lm_head, nn.Linear):
-                chunk_logits = lm_head(chunk_h)
-            elif isinstance(lm_head, nn.Embedding):
-                chunk_logits = F.linear(chunk_h, lm_head.weight)
-            elif isinstance(lm_head, torch.Tensor):
-                chunk_logits = F.linear(chunk_h, lm_head)
-            else:
-                chunk_logits = F.linear(chunk_h, lm_head.weight)
+        if isinstance(lm_head, nn.Linear):
+            chunk_logits = lm_head(chunk_h)
+        elif isinstance(lm_head, nn.Embedding):
+            chunk_logits = F.linear(chunk_h, lm_head.weight)
+        elif isinstance(lm_head, torch.Tensor):
+            chunk_logits = F.linear(chunk_h, lm_head)
+        else:
+            chunk_logits = F.linear(chunk_h, lm_head.weight)
 
-            chunk_loss = F.cross_entropy(
-                chunk_logits.float(),
-                chunk_targets,
-                ignore_index=-100,
-                reduction="sum",
-            )
-            total_loss = total_loss + chunk_loss
+        chunk_loss = F.cross_entropy(
+            chunk_logits.float(),
+            chunk_targets,
+            ignore_index=-100,
+            reduction="sum",
+        )
+        total_loss = total_loss + chunk_loss
 
-    return total_loss / torch.clamp(total_valid, min=1)
+    return total_loss / torch.clamp(total_valid.float(), min=1.0)
 
 
 def compute_chunked_semantic_loss(
@@ -70,23 +58,13 @@ def compute_chunked_semantic_loss(
     chunk_size: int = 512,
 ) -> torch.Tensor:
     """
-    Computes semantic cross-entropy loss in small token chunks directly from
-    fast_hidden_states, avoiding the 245.76 MB codebook_logits allocation.
-    Saves ~450 MB VRAM during training.
+    Computes semantic cross-entropy loss in chunks without host-device sync barriers.
+    Safe for TPU XLA and GPU.
     """
     flat_h = fast_hidden_states.reshape(-1, fast_hidden_states.size(-1))
     flat_labels = filtered_codebook_labels.reshape(-1)
 
-    valid_mask = flat_labels != -100
-    total_valid = valid_mask.sum()
-    if total_valid == 0:
-        return torch.tensor(
-            0.0,
-            device=fast_hidden_states.device,
-            dtype=fast_hidden_states.dtype,
-            requires_grad=True,
-        )
-
+    total_valid = (flat_labels != -100).sum()
     total_loss = torch.tensor(0.0, device=fast_hidden_states.device, dtype=torch.float32)
     num_tokens = flat_h.size(0)
 
@@ -95,17 +73,16 @@ def compute_chunked_semantic_loss(
         chunk_h = flat_h[start:end]
         chunk_labels = flat_labels[start:end]
 
-        if (chunk_labels != -100).any():
-            chunk_logits = fast_output(chunk_h)
-            chunk_loss = F.cross_entropy(
-                chunk_logits.float(),
-                chunk_labels,
-                ignore_index=-100,
-                reduction="sum",
-            )
-            total_loss = total_loss + chunk_loss
+        chunk_logits = fast_output(chunk_h)
+        chunk_loss = F.cross_entropy(
+            chunk_logits.float(),
+            chunk_labels,
+            ignore_index=-100,
+            reduction="sum",
+        )
+        total_loss = total_loss + chunk_loss
 
-    return total_loss / torch.clamp(total_valid, min=1)
+    return total_loss / torch.clamp(total_valid.float(), min=1.0)
 
 
 class TextToSemantic(L.LightningModule):
@@ -328,34 +305,33 @@ class TextToSemantic(L.LightningModule):
             flat_h = fast_hidden_states.reshape(-1, fast_hidden_states.size(-1))
             flat_labels = labels.reshape(-1)
             valid_mask = (flat_labels != -100) & (flat_labels != CODEBOOK_PAD_TOKEN_ID)
-            if not valid_mask.any():
-                return torch.tensor(0.0, device=labels.device)
+            total_valid = valid_mask.sum()
 
-            v_h = flat_h[valid_mask]
-            v_l = flat_labels[valid_mask]
-            total_correct = 0
+            total_correct = torch.tensor(0, device=labels.device, dtype=torch.long)
             chunk_size = 512
 
             with torch.no_grad():
-                for start in range(0, v_h.size(0), chunk_size):
-                    chunk_logits = fast_output(v_h[start : start + chunk_size])
+                for start in range(0, flat_h.size(0), chunk_size):
+                    end = min(start + chunk_size, flat_h.size(0))
+                    chunk_logits = fast_output(flat_h[start:end])
                     _, indices = chunk_logits.topk(5, dim=-1)
-                    total_correct += indices.eq(v_l[start : start + chunk_size].unsqueeze(-1)).sum().item()
+                    target = flat_labels[start:end].unsqueeze(-1)
+                    mask = valid_mask[start:end].unsqueeze(-1)
+                    matches = indices.eq(target) & mask
+                    total_correct = total_correct + matches.any(dim=-1).sum()
 
-            return torch.tensor(total_correct / v_h.size(0), device=labels.device)
+            return total_correct.float() / torch.clamp(total_valid.float(), min=1.0)
 
         if logits is None:
             return torch.tensor(0.0, device=labels.device)
 
         mask = (labels != -100) & (labels != CODEBOOK_PAD_TOKEN_ID)
-        if mask.sum() == 0:
-            return torch.tensor(0.0, device=logits.device)
+        total_valid = mask.sum()
 
         _, indices = logits.topk(5, dim=-1)
-        correct = indices.eq(labels.unsqueeze(-1))
-        correct[~mask] = 0
-        correct = correct.sum()
-        accuracy = correct / mask.sum()
+        matches = indices.eq(labels.unsqueeze(-1)) & mask.unsqueeze(-1)
+        correct = matches.any(dim=-1).sum()
+        accuracy = correct.float() / torch.clamp(total_valid.float(), min=1.0)
 
         return accuracy
 

@@ -93,6 +93,7 @@ def process_batch(files: list[Path], model) -> float:
     new_files = []
     max_length = total_time = 0
 
+    dev = next(model.parameters()).device
     for file in files:
         try:
             wav, sr = torchaudio.load(
@@ -105,7 +106,7 @@ def process_batch(files: list[Path], model) -> float:
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0, keepdim=True)
 
-        wav = torchaudio.functional.resample(wav.cuda(), sr, model.sample_rate)[0]
+        wav = torchaudio.functional.resample(wav.to(dev), sr, model.sample_rate)[0]
         total_time += len(wav) / model.sample_rate
         max_length = max(max_length, len(wav))
 
@@ -120,7 +121,7 @@ def process_batch(files: list[Path], model) -> float:
         wavs[i] = torch.nn.functional.pad(wav, (0, max_length - len(wav)), "constant")
 
     audios = torch.stack(wavs, dim=0)[:, None]
-    audio_lengths = torch.tensor(audio_lengths, device=model.device, dtype=torch.long)
+    audio_lengths = torch.tensor(audio_lengths, device=dev, dtype=torch.long)
 
     # Calculate lengths
     indices, feature_lengths = model.encode(audios, audio_lengths)

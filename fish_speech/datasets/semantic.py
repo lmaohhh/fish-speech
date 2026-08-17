@@ -522,11 +522,8 @@ class TextDataCollator:
     def batchify(self, examples, tokens_key="tokens", labels_key="labels"):
         tokens, attention_masks, labels = [], [], []
 
-        # Calculate the max length
-        max_tokens_length = 0
-        for example in examples:
-            max_tokens_length = max(max_tokens_length, example[tokens_key].size(1))
-        max_tokens_length = min(max_tokens_length, self.max_length)
+        # Fixed padding length for TPU XLA static graph compilation stability
+        max_tokens_length = self.max_length
 
         for example in examples:
             _tokens = example[tokens_key][:, :max_tokens_length]

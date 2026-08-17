@@ -13,7 +13,6 @@ from einops import rearrange
 from loguru import logger
 from torch import Tensor
 from torch.nn import functional as F
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from fish_speech.models.text2semantic.lora import LoraConfig, setup_lora
@@ -1010,15 +1009,13 @@ class Attention(nn.Module):
 
         if self.use_sdpa:
             if mask is None:
-                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                    y = F.scaled_dot_product_attention(
-                        q,
-                        k,
-                        v,
-                        dropout_p=self.dropout if self.training else 0.0,
-                        is_causal=True,
-                        # No third party attn_mask here to use flash_attention
-                    )
+                y = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=True,
+                )
             else:
                 y = F.scaled_dot_product_attention(
                     q,
