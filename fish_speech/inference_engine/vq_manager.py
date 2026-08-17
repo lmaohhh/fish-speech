@@ -18,7 +18,18 @@ class VQManager:
 
         if isinstance(self.decoder_model, DAC):
             dev = getattr(self.decoder_model, "device", "cpu")
-            return self.decoder_model.from_indices(codes[None].to(device=dev))[0].squeeze()
+            num_frames = codes.shape[-1]
+            chunk_size = 120
+            if num_frames <= chunk_size:
+                return self.decoder_model.from_indices(codes[None].to(device=dev))[0].squeeze().cpu().numpy()
+            
+            import numpy as np
+            all_audio = []
+            for i in range(0, num_frames, chunk_size):
+                chunk = codes[:, i : i + chunk_size]
+                audio_chunk = self.decoder_model.from_indices(chunk[None].to(device=dev))[0].squeeze().cpu().numpy()
+                all_audio.append(audio_chunk)
+            return np.concatenate(all_audio)
 
         raise ValueError(f"Unknown model type: {type(self.decoder_model)}")
 

@@ -186,4 +186,6 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             segment = self.decode_vq_tokens(codes=result.codes)
 
         # Convert the audio to numpy
-        return segment.float().cpu().numpy()
+        if isinstance(segment, torch.Tensor):
+            return segment.float().cpu().numpy()
+        return segment
