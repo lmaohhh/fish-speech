@@ -549,6 +549,13 @@ class BaseTransformer(nn.Module):
         if load_weights is False:
             logger.info("Randomly initialized model")
         else:
+            if "fp8" in str(Path(path)).lower():
+                logger.info("Using Native Blackwell FP8 (E4M3) Hardware Acceleration!")
+                from tools.llama.quantize import FP8QuantHandler
+
+                simple_quantizer = FP8QuantHandler(model)
+                model = simple_quantizer.convert_for_runtime()
+
             if "int8" in str(Path(path)):
                 logger.info("Using int8 weight-only quantization!")
                 from tools.llama.quantize import WeightOnlyInt8QuantHandler

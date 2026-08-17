@@ -241,6 +241,83 @@ class WeightOnlyInt8Linear(torch.nn.Module):
         return F.linear(input, self.weight.to(dtype=input.dtype)) * self.scales
 
 
+##### Native Blackwell FP8 (E4M3) Hardware Accelerated Code ######
+
+
+def replace_linear_native_fp8(module, prefix=""):
+    for name, child in module.named_children():
+        fqn = f"{prefix}.{name}" if prefix else name
+        if "fast_layers" in fqn or "fast_output" in fqn:
+            continue
+        if isinstance(child, nn.Linear):
+            setattr(
+                module,
+                name,
+                NativeFP8Linear(child.in_features, child.out_features),
+            )
+        else:
+            replace_linear_native_fp8(child, fqn)
+
+
+class FP8QuantHandler:
+    """
+    Quantization handler that converts model linear layers to NativeFP8Linear
+    for direct hardware-accelerated Tensor Core execution on NVIDIA Blackwell.
+    """
+    def __init__(self, mod):
+        self.mod = mod
+
+    def convert_for_runtime(self):
+        replace_linear_native_fp8(self.mod)
+        return self.mod
+
+
+class NativeFP8Linear(torch.nn.Module):
+    """
+    Native Blackwell FP8 Linear Layer executing torch._scaled_mm on 5th-Gen Tensor Cores.
+    """
+    __constants__ = ["in_features", "out_features"]
+    in_features: int
+    out_features: int
+    weight: torch.Tensor
+    scale: torch.Tensor
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.register_buffer(
+            "weight", torch.empty((out_features, in_features), dtype=torch.float8_e4m3fn, device=device)
+        )
+        self.register_buffer("scale", torch.ones((out_features, 1), dtype=torch.bfloat16, device=device))
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if input.is_cuda and hasattr(torch, "_scaled_mm"):
+            orig_shape = input.shape
+            flat_x = input.reshape(-1, self.in_features)
+            x_max = torch.max(torch.abs(flat_x)).clamp(min=1e-12)
+            scale_x = (x_max / 448.0).float()
+            x_fp8 = torch.clamp(flat_x.float() / scale_x, -448.0, 448.0).to(torch.float8_e4m3fn)
+
+            out = torch._scaled_mm(
+                x_fp8,
+                self.weight.t(),
+                scale_a=scale_x.to(input.device),
+                scale_b=self.scale.squeeze(-1).float().to(input.device),
+                out_dtype=input.dtype,
+            )
+            return out.reshape(*orig_shape[:-1], self.out_features)
+        else:
+            return F.linear(input, self.weight.float() * self.scale.float()).to(input.dtype)
+
+
 ##### weight only int4 per channel groupwise quantized code ######
 
 
