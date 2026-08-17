@@ -369,13 +369,6 @@ class BaseTransformer(nn.Module):
         freqs_cis = self.freqs_cis[:seq_len]
 
         mask = None
-        if key_padding_mask is not None and not key_padding_mask.all():
-            causal = self.causal_mask[:seq_len, :seq_len]
-            causal = rearrange(causal, "q k -> 1 1 q k")
-
-            atten_mask = rearrange(key_padding_mask, "b s -> b 1 1 s")
-            atten_mask = atten_mask.logical_not()
-            mask = causal & atten_mask
 
         for layer in self.layers:
             if self.config.use_gradient_checkpointing and self.training:
@@ -1032,27 +1025,18 @@ class Attention(nn.Module):
             k, v = self.kv_cache.update(input_pos, k, v)
 
         if self.use_sdpa:
-            if mask is None:
-                y = F.scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    dropout_p=self.dropout if self.training else 0.0,
-                    is_causal=True,
-                    enable_gqa=True if self.n_head > self.n_local_heads else False,
-                )
-            else:
-                if self.n_head > self.n_local_heads:
-                    k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-                    v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-                y = F.scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    attn_mask=mask,
-                    dropout_p=self.dropout if self.training else 0.0,
-                )
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+                enable_gqa=True if self.n_head > self.n_local_heads else False,
+            )
         else:
+            if self.n_head > self.n_local_heads:
+                k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
             y = self.eq_scaled_dot_product_attention(
                 q,
                 k,
@@ -1104,19 +1088,6 @@ class FeedForward(nn.Module):
         self.w2 = nn.Linear(config.intermediate_size, config.dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        orig_shape = x.shape
-        flat_x = x.reshape(-1, x.size(-1))
-        num_tokens = flat_x.size(0)
-
-        # Chunk if total tokens > 128 to keep peak memory strictly under ~2.5 MB per chunk
-        # Using pre-allocated tensor eliminates list accumulation and cat() duplication
-        if num_tokens > 128:
-            out = torch.empty_like(flat_x)
-            for i in range(0, num_tokens, 128):
-                chunk = flat_x[i : i + 128]
-                out[i : i + 128] = self.w2(F.silu(self.w1(chunk)) * self.w3(chunk))
-            return out.view(orig_shape)
-
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 

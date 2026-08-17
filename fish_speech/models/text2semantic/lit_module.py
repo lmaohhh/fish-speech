@@ -125,7 +125,7 @@ class TextToSemantic(L.LightningModule):
             hidden_states=outputs.hidden_states,
             lm_head=lm_head,
             labels=labels[:, 0],
-            chunk_size=256,
+            chunk_size=128,
         )
 
         # 2. Vectorized Semantic Loss (Codebook vocab is only 4096, 8 MB total)
@@ -143,8 +143,8 @@ class TextToSemantic(L.LightningModule):
             total_sem_loss = torch.tensor(0.0, device=base_loss.device, dtype=torch.float32)
             total_sem_valid = (flat_codebook_targets != -100).sum()
 
-            for sem_start in range(0, flat_fast_h.size(0), 1280):
-                sem_end = min(sem_start + 1280, flat_fast_h.size(0))
+            for sem_start in range(0, flat_fast_h.size(0), 640):
+                sem_end = min(sem_start + 640, flat_fast_h.size(0))
                 chunk_sem_logits = self.model.fast_output(flat_fast_h[sem_start:sem_end])
                 chunk_sem_loss = F.cross_entropy(
                     chunk_sem_logits.float(),
