@@ -106,6 +106,7 @@ def main(input_dir: str, output_dir: str, verify: bool):
 
     # Import safetensors if available
     try:
+        from safetensors import safe_open
         from safetensors.torch import load_file, save_file
         has_safetensors = True
     except ImportError:
@@ -114,45 +115,70 @@ def main(input_dir: str, output_dir: str, verify: bool):
 
     for weight_file in weight_files:
         logger.info(f"📦 Processing weight shard: {weight_file.name}")
-        if is_safetensors and has_safetensors:
-            state_dict = load_file(str(weight_file))
-        else:
-            state_dict = torch.load(weight_file, map_location="cpu")
-
         quantized_dict = {}
 
-        for key, tensor in state_dict.items():
-            tensor_bytes = tensor.numel() * tensor.element_size()
-            total_orig_bytes += tensor_bytes
+        if is_safetensors and has_safetensors:
+            with safe_open(str(weight_file), framework="pt", device="cpu") as f:
+                keys = f.keys()
+                for key in keys:
+                    tensor = f.get_tensor(key)
+                    tensor_bytes = tensor.numel() * tensor.element_size()
+                    total_orig_bytes += tensor_bytes
 
-            # Selective Mixed-Precision Quantization (Best Practice for Audio LLMs):
-            # 1. Slow Transformer (3.8B params, 36 layers) -> Quantize to FP8 (saves 3.8 GB VRAM)
-            # 2. Fast Transformer (230M params, 4 layers)  -> Keep in pure BF16 (preserves 100% acoustic nuance)
-            # 3. Embeddings, Norms, Output Heads          -> Keep in pure BF16
-            is_linear_weight = (
-                tensor.ndim == 2
-                and any(pattern in key for pattern in ["wqkv", "wo", "w1", "w2", "w3"])
-                and not any(skip in key for skip in ["fast_layers", "fast_project", "fast_output", "fast_embeddings", "norm", "embed", "bias"])
-            )
+                    is_linear_weight = (
+                        tensor.ndim == 2
+                        and any(pattern in key for pattern in ["wqkv", "wo", "w1", "w2", "w3"])
+                        and not any(skip in key for skip in ["fast_layers", "fast_project", "fast_output", "fast_embeddings", "norm", "embed", "bias"])
+                    )
 
-            if is_linear_weight:
-                w_fp8, scale = quantize_tensor_to_fp8_e4m3(tensor)
-                quantized_dict[key] = w_fp8
-                quantized_dict[f"{key}_scale"] = scale
+                    if is_linear_weight:
+                        w_fp8, scale = quantize_tensor_to_fp8_e4m3(tensor)
+                        quantized_dict[key] = w_fp8
+                        quantized_dict[f"{key}_scale"] = scale
 
-                fp8_bytes = w_fp8.numel() * 1 + scale.numel() * scale.element_size()
-                total_fp8_bytes += fp8_bytes
+                        fp8_bytes = w_fp8.numel() * 1 + scale.numel() * scale.element_size()
+                        total_fp8_bytes += fp8_bytes
 
-                if verify:
-                    w_recon = dequantize_fp8_to_float(w_fp8, scale, target_dtype=tensor.dtype)
-                    sim = F.cosine_similarity(tensor.flatten().float(), w_recon.flatten().float(), dim=0).item()
-                    mae = (tensor.float() - w_recon.float()).abs().mean().item()
-                    cos_sims.append(sim)
-                    maes.append(mae)
-            else:
-                # Keep embeddings, norms, and biases in original precision (BF16 / FP32)
-                quantized_dict[key] = tensor
-                total_fp8_bytes += tensor_bytes
+                        if verify:
+                            w_recon = dequantize_fp8_to_float(w_fp8, scale, target_dtype=tensor.dtype)
+                            sim = F.cosine_similarity(tensor.flatten().float(), w_recon.flatten().float(), dim=0).item()
+                            mae = (tensor.float() - w_recon.float()).abs().mean().item()
+                            cos_sims.append(sim)
+                            maes.append(mae)
+                    else:
+                        quantized_dict[key] = tensor
+                        total_fp8_bytes += tensor_bytes
+                    del tensor
+        else:
+            state_dict = torch.load(weight_file, map_location="cpu", mmap=True)
+            for key, tensor in state_dict.items():
+                tensor_bytes = tensor.numel() * tensor.element_size()
+                total_orig_bytes += tensor_bytes
+
+                is_linear_weight = (
+                    tensor.ndim == 2
+                    and any(pattern in key for pattern in ["wqkv", "wo", "w1", "w2", "w3"])
+                    and not any(skip in key for skip in ["fast_layers", "fast_project", "fast_output", "fast_embeddings", "norm", "embed", "bias"])
+                )
+
+                if is_linear_weight:
+                    w_fp8, scale = quantize_tensor_to_fp8_e4m3(tensor)
+                    quantized_dict[key] = w_fp8
+                    quantized_dict[f"{key}_scale"] = scale
+
+                    fp8_bytes = w_fp8.numel() * 1 + scale.numel() * scale.element_size()
+                    total_fp8_bytes += fp8_bytes
+
+                    if verify:
+                        w_recon = dequantize_fp8_to_float(w_fp8, scale, target_dtype=tensor.dtype)
+                        sim = F.cosine_similarity(tensor.flatten().float(), w_recon.flatten().float(), dim=0).item()
+                        mae = (tensor.float() - w_recon.float()).abs().mean().item()
+                        cos_sims.append(sim)
+                        maes.append(mae)
+                else:
+                    quantized_dict[key] = tensor
+                    total_fp8_bytes += tensor_bytes
+            del state_dict
 
         # Save quantized shard
         out_shard_path = output_path / weight_file.name
@@ -162,7 +188,7 @@ def main(input_dir: str, output_dir: str, verify: bool):
             torch.save(quantized_dict, out_shard_path)
 
         logger.info(f"✅ Saved quantized shard: {out_shard_path.name}")
-        del state_dict, quantized_dict
+        del quantized_dict
         gc.collect()
 
     # Summary Report
