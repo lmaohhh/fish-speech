@@ -27,27 +27,17 @@ def quantize_tensor_to_fp8_e4m3(
     tensor_float: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantizes a 2D weight tensor [out_features, in_features] to FP8 E4M3 with per-channel scale.
-    Formula:
-        scale = max(|W_row|) / 448.0
-        W_fp8 = (W_row / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    Quantizes a 2D weight tensor [out_features, in_features] to FP8 E4M3 with scalar scale
+    fully compatible with cuBLASLt native Tensor Core acceleration on Blackwell sm_120.
     """
-    orig_dtype = tensor_float.dtype
     w_float = tensor_float.float()
-
-    if w_float.ndim == 2:
-        # Per-channel (per row / out_features) scaling
-        row_max = torch.max(torch.abs(w_float), dim=-1, keepdim=True).values.clamp(min=1e-12)
-        scale = row_max / FP8_MAX_VAL
-    else:
-        # Per-tensor scaling for 1D or other shapes
-        t_max = torch.max(torch.abs(w_float)).clamp(min=1e-12)
-        scale = t_max / FP8_MAX_VAL
+    t_max = torch.max(torch.abs(w_float)).clamp(min=1e-12)
+    scale = (t_max / FP8_MAX_VAL).reshape(1)
 
     scaled_w = torch.clamp(w_float / scale, -FP8_MAX_VAL, FP8_MAX_VAL)
     w_fp8 = scaled_w.to(torch.float8_e4m3fn)
 
-    return w_fp8, scale.to(orig_dtype)
+    return w_fp8, scale.float()
 
 
 def dequantize_fp8_to_float(

@@ -296,21 +296,20 @@ class NativeFP8Linear(torch.nn.Module):
         self.register_buffer(
             "weight", torch.empty((out_features, in_features), dtype=torch.float8_e4m3fn, device=device)
         )
-        self.register_buffer("scale", torch.ones((out_features, 1), dtype=torch.bfloat16, device=device))
+        self.register_buffer("scale", torch.ones(1, dtype=torch.float32, device=device))
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if input.is_cuda and hasattr(torch, "_scaled_mm"):
             orig_shape = input.shape
             flat_x = input.reshape(-1, self.in_features)
-            x_max = torch.max(torch.abs(flat_x)).clamp(min=1e-12)
-            scale_x = (x_max / 448.0).float()
+            scale_x = (flat_x.abs().max() / 448.0).clamp(min=1e-12).float().reshape(1)
             x_fp8 = torch.clamp(flat_x.float() / scale_x, -448.0, 448.0).to(torch.float8_e4m3fn)
 
             out = torch._scaled_mm(
                 x_fp8,
                 self.weight.t(),
-                scale_a=scale_x.to(input.device),
-                scale_b=self.scale.squeeze(-1).float().to(input.device),
+                scale_a=scale_x,
+                scale_b=self.scale.float().reshape(1),
                 out_dtype=input.dtype,
             )
             return out.reshape(*orig_shape[:-1], self.out_features)
