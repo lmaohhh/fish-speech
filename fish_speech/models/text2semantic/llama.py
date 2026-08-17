@@ -867,9 +867,9 @@ class DualARTransformer(BaseTransformer):
             for i in range(0, len(self.fast_layers), 2):
                 block_layers = self.fast_layers[i : i + 2]
                 if self.config.use_gradient_checkpointing and self.training:
-                    x = checkpoint(run_fast_block, block_layers, x, fast_freqs_cis, fast_mask, use_reentrant=False)
+                    x = checkpoint(run_fast_transformer, self.fast_layers[i : i + 2], x, fast_freqs_cis, fast_mask, use_reentrant=False)
                 else:
-                    x = run_fast_block(block_layers, x, fast_freqs_cis, fast_mask)
+                    x = run_fast_transformer(self.fast_layers[i : i + 2], x, fast_freqs_cis, fast_mask)
 
         # unflatten the batch and num_codebooks
         fast_out = self.fast_norm(x)
