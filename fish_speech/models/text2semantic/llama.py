@@ -313,6 +313,7 @@ class BaseTransformer(nn.Module):
         if self.max_seq_len >= max_seq_len and self.max_batch_size >= max_batch_size:
             return
 
+        max_seq_len = min(max_seq_len, 4096)
         max_seq_len = find_multiple(max_seq_len, 8)
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size

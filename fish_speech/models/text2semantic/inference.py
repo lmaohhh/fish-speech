@@ -283,7 +283,7 @@ def generate(
         with torch.device(device):
             model.setup_caches(
                 max_batch_size=1,  # Fixed to 1, avoid dynamic changes
-                max_seq_len=model.config.max_seq_len,
+                max_seq_len=min(model.config.max_seq_len, 4096),
                 dtype=next(model.parameters()).dtype,
             )
         model._cache_setup_done = True
@@ -761,7 +761,7 @@ def launch_thread_safe_queue(
         with torch.device(device):
             model.setup_caches(
                 max_batch_size=1,
-                max_seq_len=model.config.max_seq_len,
+                max_seq_len=min(model.config.max_seq_len, 4096),
                 dtype=next(model.parameters()).dtype,
             )
         init_event.set()
@@ -880,7 +880,7 @@ def main(
     with torch.device(device):
         model.setup_caches(
             max_batch_size=1,
-            max_seq_len=model.config.max_seq_len,
+            max_seq_len=min(model.config.max_seq_len, 4096),
             dtype=next(model.parameters()).dtype,
         )
     if torch.cuda.is_available():
