@@ -21,17 +21,15 @@ except Exception:
 
 _globals = globals()
 
-# Primary: Use builder if available (Protobuf 4.25+)
 built = False
 try:
     from google.protobuf.internal import builder as _builder
     _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
     _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, "text_data_pb2", _globals)
     built = True
-except (ImportError, AttributeError):
-    pass
+except Exception:
+    built = False
 
-# Fallback: Use reflection (Works universally across Protobuf 3.x, 4.x, 5.x)
 if not built:
     for name in ["Semantics", "Sentence", "TextData", "SampledData"]:
         desc = DESCRIPTOR.message_types_by_name[name]
@@ -49,7 +47,7 @@ if not built:
         except Exception:
             pass
 
-if _descriptor._USE_C_DESCRIPTORS == False:
+if built and _descriptor._USE_C_DESCRIPTORS == False and "_SEMANTICS" in _globals:
     DESCRIPTOR._options = None
     _globals["_SEMANTICS"]._serialized_start = 30
     _globals["_SEMANTICS"]._serialized_end = 57
