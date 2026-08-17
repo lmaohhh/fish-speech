@@ -29,7 +29,8 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = True
 
 # register eval resolver
-OmegaConf.register_new_resolver("eval", eval)
+if not OmegaConf.has_resolver("eval"):
+    OmegaConf.register_new_resolver("eval", eval)
 
 import fish_speech.utils as utils
 from fish_speech.utils.instantiators import instantiate_callbacks, instantiate_loggers
