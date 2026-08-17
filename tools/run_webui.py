@@ -47,13 +47,17 @@ if __name__ == "__main__":
     args.precision = torch.half if args.half else torch.bfloat16
 
     # Check if MPS or CUDA is available
-    if torch.backends.mps.is_available():
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    elif torch.backends.mps.is_available():
         args.device = "mps"
         logger.info("mps is available, running on mps.")
     elif torch.xpu.is_available():
         args.device = "xpu"
         logger.info("XPU is available, running on XPU.")
-    elif not torch.cuda.is_available():
+    else:
         logger.info("CUDA is not available, running on CPU.")
         args.device = "cpu"
 
