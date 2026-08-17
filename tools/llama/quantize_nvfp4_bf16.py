@@ -128,7 +128,7 @@ def dequantize_tensor_from_nvfp4_two_level(
     target_dtype: torch.dtype = torch.bfloat16
 ) -> torch.Tensor:
     """
-    Giải nén ngược (Dequantize) từ chuẩn NVFP4 Two-Level về tensor gốc để kiểm tra sai số.
+    Giải nén ngược (Dequantize) từ chuẩn NVFP4 Two-Level về tensor gốc để kiểm tra sai số hoặc suy luận.
     """
     # 1. Giải mã byte uint8 thành 2 mã 4-bit
     high_codes = (packed_weight >> 4) & 0x0F
@@ -144,7 +144,7 @@ def dequantize_tensor_from_nvfp4_two_level(
 
     # 3. Nhân với hệ số scale hai cấp (Global Scale * Block Scale)
     blocks = values.reshape(-1, block_size)
-    scales_expanded = (block_scales.float() * global_scale).unsqueeze(-1)
+    scales_expanded = (block_scales.float() * float(global_scale)).unsqueeze(-1)
     dequant_blocks = blocks * scales_expanded
 
     flat = dequant_blocks.reshape(-1)
@@ -154,6 +154,78 @@ def dequantize_tensor_from_nvfp4_two_level(
         flat = flat[:-pad_len]
 
     return flat.reshape(orig_shape).to(target_dtype)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RUNTIME HOOK: NVFP4 LINEAR LAYER DÀNH CHO SUY LUẬN SIÊU NHẸ TRÊN VRAM (<2.5GB)
+# ═══════════════════════════════════════════════════════════════════════════════
+class NVFP4Linear(torch.nn.Module):
+    __constants__ = ["in_features", "out_features"]
+    in_features: int
+    out_features: int
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        block_size: int = NVFP4_DEFAULT_BLOCK_SIZE,
+        bias: bool = False,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.block_size = block_size
+        numel = in_features * out_features
+        pad_len = (block_size - (numel % block_size)) % block_size
+        packed_numel = (numel + pad_len) // 2
+        num_blocks = (numel + pad_len) // block_size
+
+        self.register_buffer("nvfp4_weight", torch.empty(packed_numel, dtype=torch.uint8, device=device))
+        
+        scale_dtype = torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else torch.bfloat16
+        self.register_buffer("nvfp4_block_scales", torch.empty(num_blocks, dtype=scale_dtype, device=device))
+        self.register_buffer("nvfp4_global_scale", torch.tensor(1.0, dtype=torch.float32, device=device))
+        self.pad_len = pad_len
+        self.orig_shape = (out_features, in_features)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        global_scale_val = self.nvfp4_global_scale.item() if isinstance(self.nvfp4_global_scale, torch.Tensor) else float(self.nvfp4_global_scale)
+        weight_bf16 = dequantize_tensor_from_nvfp4_two_level(
+            self.nvfp4_weight,
+            self.nvfp4_block_scales,
+            global_scale_val,
+            self.pad_len,
+            self.orig_shape,
+            block_size=self.block_size,
+            target_dtype=input.dtype
+        )
+        return F.linear(input, weight_bf16)
+
+
+def replace_linear_weight_only_nvfp4(module, prefix=""):
+    for name, child in module.named_children():
+        fqn = f"{prefix}.{name}" if prefix else name
+        if is_fast_transformer_layer(fqn):
+            continue
+        if isinstance(child, nn.Linear):
+            setattr(
+                module,
+                name,
+                NVFP4Linear(child.in_features, child.out_features),
+            )
+        else:
+            replace_linear_weight_only_nvfp4(child, fqn)
+
+
+class WeightOnlyNVFP4QuantHandler:
+    def __init__(self, mod):
+        self.mod = mod
+
+    def convert_for_runtime(self):
+        replace_linear_weight_only_nvfp4(self.mod)
+        return self.mod
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
