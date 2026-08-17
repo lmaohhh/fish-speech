@@ -17,6 +17,12 @@ from torch.utils.checkpoint import checkpoint
 
 from fish_speech.models.text2semantic.lora import LoraConfig, setup_lora
 
+try:
+    import torch_xla
+    torch.xla = torch_xla
+except ImportError:
+    pass
+
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
@@ -375,7 +381,7 @@ class BaseTransformer(nn.Module):
 
         for i in range(0, len(self.layers), 2):
             block_layers = self.layers[i : i + 2]
-            if self.config.use_gradient_checkpointing and self.training:
+            if self.config.use_gradient_checkpointing and self.training and x.device.type != "xla":
                 x = checkpoint(run_layer_block, block_layers, x, freqs_cis, mask, use_reentrant=False)
             else:
                 x = run_layer_block(block_layers, x, freqs_cis, mask)
@@ -868,7 +874,7 @@ class DualARTransformer(BaseTransformer):
             chunk_size = 512
             for i in range(0, x.size(0), chunk_size):
                 chunk_x = x[i : i + chunk_size]
-                if self.config.use_gradient_checkpointing:
+                if self.config.use_gradient_checkpointing and x.device.type != "xla":
                     chunk_out = checkpoint(run_fast_transformer, self.fast_layers, chunk_x, fast_freqs_cis, fast_mask, use_reentrant=False)
                 else:
                     chunk_out = run_fast_transformer(self.fast_layers, chunk_x, fast_freqs_cis, fast_mask)
@@ -877,7 +883,7 @@ class DualARTransformer(BaseTransformer):
         else:
             for i in range(0, len(self.fast_layers), 2):
                 block_layers = self.fast_layers[i : i + 2]
-                if self.config.use_gradient_checkpointing and self.training:
+                if self.config.use_gradient_checkpointing and self.training and x.device.type != "xla":
                     x = checkpoint(run_fast_transformer, self.fast_layers[i : i + 2], x, fast_freqs_cis, fast_mask, use_reentrant=False)
                 else:
                     x = run_fast_transformer(self.fast_layers[i : i + 2], x, fast_freqs_cis, fast_mask)
