@@ -72,7 +72,15 @@ def merge(lora_config, base_weight, lora_weight, output):
     # Trigger eval mode to merge lora
     llama_model.eval()
     llama_model.save_pretrained(output, drop_lora=True)
-    logger.info(f"Saved merged model to {output}, validating")
+
+    # Copy tokenizer and config files to output directory
+    for file in Path(base_weight).glob("*"):
+        if file.is_file() and file.suffix in [".json", ".tiktoken", ".txt", ".bin"]:
+            dest = output / file.name
+            if not dest.exists():
+                shutil.copyfile(file, dest)
+
+    logger.info(f"Saved merged model and tokenizer to {output}, validating")
 
     new_state_dict = torch.load(output / "model.pth", map_location="cpu")
     original_keys = set(llama_state_dict_copy.keys())
