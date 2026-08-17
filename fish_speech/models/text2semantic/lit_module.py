@@ -128,7 +128,7 @@ class TextToSemantic(L.LightningModule):
             chunk_size=128,
         )
 
-        # 2. Static Vectorized Semantic Loss (100% Static Tensor for Zero-Recompilation)
+        # 2. Vectorized Semantic Loss (Codebook vocab is only 4096, 160 MB total - eliminates 3.2 GB XLA slice pad buffers)
         token_ids = labels[:, 0]
         semantic_mask = (token_ids >= self.model.tokenizer.semantic_begin_id) & (
             token_ids <= self.model.tokenizer.semantic_end_id
@@ -140,23 +140,12 @@ class TextToSemantic(L.LightningModule):
         masked_codebook_labels[~semantic_mask] = -100
 
         if outputs.fast_hidden_states is not None:
-            flat_fast_h = outputs.fast_hidden_states.reshape(-1, outputs.fast_hidden_states.size(-1))
-            flat_codebook_targets = masked_codebook_labels.reshape(-1)
-            total_sem_loss = torch.tensor(0.0, device=base_loss.device, dtype=torch.float32)
-            total_sem_valid = (flat_codebook_targets != -100).sum()
-
-            for sem_start in range(0, flat_fast_h.size(0), 640):
-                sem_end = min(sem_start + 640, flat_fast_h.size(0))
-                chunk_sem_logits = self.model.fast_output(flat_fast_h[sem_start:sem_end])
-                chunk_sem_loss = F.cross_entropy(
-                    chunk_sem_logits.float(),
-                    flat_codebook_targets[sem_start:sem_end],
-                    ignore_index=-100,
-                    reduction="sum",
-                )
-                total_sem_loss = total_sem_loss + chunk_sem_loss
-
-            semantic_loss = total_sem_loss / torch.clamp(total_sem_valid.float(), min=1.0)
+            fast_logits = self.model.fast_output(outputs.fast_hidden_states)
+            semantic_loss = F.cross_entropy(
+                fast_logits.view(-1, self.model.config.codebook_size).float(),
+                masked_codebook_labels.reshape(-1),
+                ignore_index=-100,
+            )
         else:
             semantic_loss = torch.tensor(0.0, device=base_loss.device)
 
