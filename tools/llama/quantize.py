@@ -247,7 +247,7 @@ class WeightOnlyInt8Linear(torch.nn.Module):
 def replace_linear_native_fp8(module, prefix=""):
     for name, child in module.named_children():
         fqn = f"{prefix}.{name}" if prefix else name
-        if "fast_layers" in fqn or "fast_output" in fqn:
+        if "fast_layers" in fqn or "fast_output" in fqn or "fast_project" in fqn:
             continue
         if isinstance(child, nn.Linear):
             setattr(

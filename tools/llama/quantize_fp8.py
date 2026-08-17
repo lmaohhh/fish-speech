@@ -135,11 +135,14 @@ def main(input_dir: str, output_dir: str, verify: bool):
             tensor_bytes = tensor.numel() * tensor.element_size()
             total_orig_bytes += tensor_bytes
 
-            # Quantize linear projection weights (attention wqkv, wo, ffn w1, w2, w3, fast_layers)
+            # Selective Mixed-Precision Quantization (Best Practice for Audio LLMs):
+            # 1. Slow Transformer (3.8B params, 36 layers) -> Quantize to FP8 (saves 3.8 GB VRAM)
+            # 2. Fast Transformer (230M params, 4 layers)  -> Keep in pure BF16 (preserves 100% acoustic nuance)
+            # 3. Embeddings, Norms, Output Heads          -> Keep in pure BF16
             is_linear_weight = (
                 tensor.ndim == 2
-                and any(pattern in key for pattern in ["wqkv", "wo", "w1", "w2", "w3", "fast_layers", "fast_project"])
-                and not any(skip in key for skip in ["norm", "embed", "bias"])
+                and any(pattern in key for pattern in ["wqkv", "wo", "w1", "w2", "w3"])
+                and not any(skip in key for skip in ["fast_layers", "fast_project", "fast_output", "fast_embeddings", "norm", "embed", "bias"])
             )
 
             if is_linear_weight:
