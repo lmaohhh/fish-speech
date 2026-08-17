@@ -35,6 +35,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         self.decoder_model = decoder_model
         self.precision = precision
         self.compile = compile
+        self.llama_device = "cuda" if torch.cuda.is_available() else "cpu"
 
     @torch.inference_mode()
     def inference(self, req: ServeTTSRequest) -> Generator[InferenceResult, None, None]:
@@ -48,20 +49,16 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         ref_id: str | None = req.reference_id
         prompt_tokens, prompt_texts = [], []
         # Load the reference audio and text based on id or hash
-        if ref_id is not None:
-            prompt_tokens, prompt_texts = self.load_by_id(ref_id, req.use_memory_cache)
-
-        elif req.references:
-            prompt_tokens, prompt_texts = self.load_by_hash(
-                req.references, req.use_memory_cache
+        if req.references:
+            for ref in req.references:
+                prompt_tokens.append(ref.audio)
+                prompt_texts.append(ref.text)
+        elif ref_id is not None:
+            prompt_tokens, prompt_texts = self.load_reference(
+                ref_id=ref_id, enable_reference_audio=req.chunk_length > 0
             )
 
-        # Set the random seed if provided
-        if req.seed is not None:
-            set_seed(req.seed)
-            logger.warning(f"set seed: {req.seed}")
-
-        # Get the symbolic tokens from the LLAMA model
+        # Get response queue
         response_queue = self.send_Llama_request(req, prompt_tokens, prompt_texts)
 
         # Get the sample rate from the decoder model
@@ -150,7 +147,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
         # Prepare the request
         request = dict(
-            device=self.decoder_model.device,
+            device=self.llama_device,
             max_new_tokens=req.max_new_tokens,
             text=req.text,
             top_p=req.top_p,

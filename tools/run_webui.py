@@ -33,6 +33,7 @@ def parse_args():
     )
     parser.add_argument("--decoder-config-name", type=str, default="modded_dac_vq")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--decoder-device", type=str, default="cpu")
     parser.add_argument("--half", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--max-gradio-length", type=int, default=0)
@@ -68,7 +69,7 @@ if __name__ == "__main__":
     decoder_model = load_decoder_model(
         config_name=args.decoder_config_name,
         checkpoint_path=args.decoder_checkpoint_path,
-        device=args.device,
+        device=args.decoder_device,
     )
 
     logger.info("Decoder model loaded, warming up...")
