@@ -99,8 +99,11 @@ def train(cfg: DictConfig) -> tuple[dict, dict]:
     }
 
     if logger:
-        log.info("Logging hyperparameters!")
-        log_hyperparameters(object_dict)
+        try:
+            log.info("Logging hyperparameters!")
+            log_hyperparameters(object_dict)
+        except Exception as e:
+            log.warning(f"Skipping hyperparameter logging due to logger error: {e}")
 
     if cfg.get("train"):
         log.info("Starting training!")
