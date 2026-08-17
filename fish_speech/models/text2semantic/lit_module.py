@@ -162,10 +162,10 @@ class TextToSemantic(L.LightningModule):
 
         self.log(
             f"{stage}/loss",
-            loss,
+            loss.detach(),
             on_step=is_train,
             on_epoch=not is_train,
-            prog_bar=True,
+            prog_bar=False,
             logger=True,
             sync_dist=not is_train,
         )
@@ -181,7 +181,7 @@ class TextToSemantic(L.LightningModule):
 
         self.log(
             f"{stage}/base_loss",
-            base_loss,
+            base_loss.detach(),
             on_step=is_train,
             on_epoch=not is_train,
             prog_bar=False,
@@ -191,7 +191,7 @@ class TextToSemantic(L.LightningModule):
 
         self.log(
             f"{stage}/semantic_loss",
-            semantic_loss,
+            semantic_loss.detach(),
             on_step=is_train,
             on_epoch=not is_train,
             prog_bar=False,
