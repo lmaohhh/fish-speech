@@ -618,20 +618,23 @@ class BaseTransformer(nn.Module):
             import gc
             gc.collect()
             logger.info(f"Model weights loaded - Status: {err}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # Re-materialize non-persistent buffers (they were on meta device)
             _buf_device = _load_device
+            buf_max_seq_len = min(config.max_seq_len, 4096)
             model.register_buffer(
                 "freqs_cis",
                 precompute_freqs_cis(
-                    config.max_seq_len, config.head_dim, config.rope_base
+                    buf_max_seq_len, config.head_dim, config.rope_base
                 ).to(_buf_device),
                 persistent=False,
             )
             model.register_buffer(
                 "causal_mask",
                 torch.tril(
-                    torch.ones(config.max_seq_len, config.max_seq_len,
+                    torch.ones(buf_max_seq_len, buf_max_seq_len,
                                dtype=torch.bool, device=_buf_device)
                 ),
                 persistent=False,
@@ -645,7 +648,7 @@ class BaseTransformer(nn.Module):
                     ).to(_buf_device),
                     persistent=False,
                 )
-            logger.info(f"Buffers re-materialized on {_buf_device}")
+            logger.info(f"Buffers re-materialized on {_buf_device} (seq_len={buf_max_seq_len})")
 
         if lora_config is not None:
             setup_lora(model, lora_config)
