@@ -32,6 +32,7 @@ OmegaConf.register_new_resolver("eval", eval)
 
 import fish_speech.utils as utils
 from fish_speech.utils.instantiators import instantiate_callbacks, instantiate_loggers
+from fish_speech.utils.logging_utils import log_hyperparameters
 
 log = utils.RankedLogger(__name__, rank_zero_only=True)
 
@@ -90,7 +91,7 @@ def train(cfg: DictConfig) -> tuple[dict, dict]:
 
     if logger:
         log.info("Logging hyperparameters!")
-        utils.log_hyperparameters(object_dict)
+        log_hyperparameters(object_dict)
 
     if cfg.get("train"):
         log.info("Starting training!")
