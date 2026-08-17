@@ -31,6 +31,7 @@ torch.backends.cudnn.allow_tf32 = True
 OmegaConf.register_new_resolver("eval", eval)
 
 import fish_speech.utils as utils
+from fish_speech.utils.instantiators import instantiate_callbacks, instantiate_loggers
 
 log = utils.RankedLogger(__name__, rank_zero_only=True)
 
@@ -61,10 +62,10 @@ def train(cfg: DictConfig) -> tuple[dict, dict]:
     model: LightningModule = hydra.utils.instantiate(cfg.model)
 
     log.info("Instantiating callbacks...")
-    callbacks: list[Callback] = utils.instantiate_callbacks(cfg.get("callbacks"))
+    callbacks: list[Callback] = instantiate_callbacks(cfg.get("callbacks"))
 
     log.info("Instantiating loggers...")
-    logger: list[Logger] = utils.instantiate_loggers(cfg.get("logger"))
+    logger: list[Logger] = instantiate_loggers(cfg.get("logger"))
     if not logger:
         callbacks = [
             c for c in callbacks
