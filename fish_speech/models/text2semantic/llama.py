@@ -595,17 +595,29 @@ class BaseTransformer(nn.Module):
                 for shard_path in shard_files:
                     all_weights.update(st_load_file(str(shard_path), device=_load_device))
 
-                prefixes = ["text_model.model.", "text_model.", "base_model.model.", "base_model.", "model."]
-                cleaned_weights = {}
-                for k, v in all_weights.items():
-                    if "audio_" in k:
-                        continue
-                    k_clean = k
-                    for p in prefixes:
-                        if k_clean.startswith(p):
-                            k_clean = k_clean[len(p):]
-                            break
-                    cleaned_weights[k_clean] = v
+                def remap_s2_pro_key(k: str) -> str:
+                    # 1. Audio Decoder / Fast AR Mapping
+                    if "audio_decoder." in k or "audio_model.model." in k or "audio_model." in k:
+                        k_sub = k.replace("audio_decoder.", "").replace("audio_model.model.", "").replace("audio_model.", "")
+                        if k_sub == "embeddings.weight":
+                            return "fast_embeddings.weight"
+                        elif k_sub.startswith("layers."):
+                            return k_sub.replace("layers.", "fast_layers.")
+                        elif k_sub == "norm.weight":
+                            return "fast_norm.weight"
+                        elif k_sub in ("output.weight", "lm_head.weight"):
+                            return "fast_output.weight"
+                        elif k_sub == "codebook_embeddings.weight":
+                            return "codebook_embeddings.weight"
+                        return k_sub
+
+                    # 2. Text Model / Slow AR Mapping
+                    for p in ["text_model.model.", "text_model.", "base_model.model.", "base_model.", "model."]:
+                        if k.startswith(p):
+                            return k[len(p):]
+                    return k
+
+                cleaned_weights = {remap_s2_pro_key(k): v for k, v in all_weights.items()}
 
                 err = model.load_state_dict(cleaned_weights, strict=False, assign=True)
                 del all_weights, cleaned_weights
