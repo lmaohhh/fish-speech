@@ -580,23 +580,46 @@ class BaseTransformer(nn.Module):
             single_st = path_obj / "model.safetensors"
             pth_file = path_obj / "model.pth"
 
-            if index_json.exists() and any((path_obj / shard).exists() for shard in json.load(open(index_json)).get("weight_map", {}).values()):
-                logger.info(f"Loading sharded safetensors weights to {_load_device}")
-                from safetensors.torch import load_file as st_load_file
+            if index_json.exists() or single_st.exists():
+                from safetensors import safe_open
+                if index_json.exists():
+                    logger.info(f"Streaming sharded safetensors weights directly to {_load_device} (0 MB RAM overhead)...")
+                    with open(index_json) as f:
+                        st_index = json.load(f)
+                    shard_files = [path_obj / s for s in sorted(set(st_index["weight_map"].values()))]
+                else:
+                    logger.info(f"Streaming single safetensors weights directly to {_load_device}...")
+                    shard_files = [single_st]
 
-                with open(index_json) as f:
-                    st_index = json.load(f)
-                shard_files = sorted(set(st_index["weight_map"].values()))
-                weights = OrderedDict()
-                for shard in shard_files:
-                    weights.update(st_load_file(str(path_obj / shard), device=_load_device))
-                weights = _remap_fish_qwen3_omni_keys(weights)
-            elif single_st.exists():
-                logger.info(f"Loading single safetensors weights to {_load_device}")
-                from safetensors.torch import load_file as st_load_file
-
-                weights = OrderedDict(st_load_file(str(single_st), device=_load_device))
-                weights = _remap_fish_qwen3_omni_keys(weights)
+                # Map state dict directly tensor-by-tensor
+                loaded_keys = set()
+                for shard_path in shard_files:
+                    with safe_open(str(shard_path), framework="pt", device=_load_device) as f:
+                        for key in f.keys():
+                            tensor = f.get_tensor(key)
+                            # Remap key if needed
+                            remapped_key = key
+                            if remapped_key.startswith("model."):
+                                remapped_key = remapped_key.replace("model.", "")
+                            if "audio_" in remapped_key:
+                                continue
+                            
+                            # Assign directly to model parameter / buffer
+                            target_mod = model
+                            parts = remapped_key.split(".")
+                            for p in parts[:-1]:
+                                if hasattr(target_mod, p):
+                                    target_mod = getattr(target_mod, p)
+                                else:
+                                    target_mod = None
+                                    break
+                            if target_mod is not None:
+                                p_name = parts[-1]
+                                if hasattr(target_mod, p_name):
+                                    setattr(target_mod, p_name, torch.nn.Parameter(tensor, requires_grad=False) if isinstance(getattr(target_mod, p_name, None), torch.nn.Parameter) else tensor)
+                                    loaded_keys.add(remapped_key)
+                
+                logger.info(f"Streamed {len(loaded_keys)} tensors safely into VRAM.")
             elif pth_file.exists():
                 logger.info(f"Loading model.pth weights to {_load_device}")
                 weights = torch.load(
@@ -614,14 +637,11 @@ class BaseTransformer(nn.Module):
                 for k in list(weights.keys()):
                     if "audio_" in k:
                         weights.pop(k)
-            else:
-                raise FileNotFoundError(f"No model weights found in {path_obj}")
-
-            err = model.load_state_dict(weights, strict=False, assign=True)
-            del weights
-            import gc
-            gc.collect()
-            logger.info(f"Model weights loaded - Status: {err}")
+                err = model.load_state_dict(weights, strict=False, assign=True)
+                del weights
+                import gc
+                gc.collect()
+                logger.info(f"Model weights loaded - Status: {err}")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -826,7 +846,10 @@ class DualARTransformer(BaseTransformer):
         fast_freqs_cis = self.fast_freqs_cis[:fast_seq_len]
 
         # Extract codebooks statically for all sequence positions: [B, 9, S] -> [B, S, 9]
-        all_codebooks = labels[:, 1 : self.config.num_codebooks, :]
+        if labels is None:
+            all_codebooks = inp[:, 1 : self.config.num_codebooks, :]
+        else:
+            all_codebooks = labels[:, 1 : self.config.num_codebooks, :]
         codebooks = all_codebooks.permute(0, 2, 1)
 
         bsz, seqlen = x.shape[:2]

@@ -362,7 +362,11 @@ def generate(
 def init_model(checkpoint_path, device, precision, compile=False):
     model = DualARTransformer.from_pretrained(checkpoint_path, load_weights=True)
 
-    model = model.to(device=device, dtype=precision)
+    # Do NOT cast FP8 models to precision because it dequantizes FP8 back to BF16 and doubles VRAM
+    if "fp8" not in str(Path(checkpoint_path)).lower() and "int" not in str(Path(checkpoint_path)).lower():
+        model = model.to(device=device, dtype=precision)
+    else:
+        model = model.to(device=device)
     logger.info(f"Restored model from checkpoint")
 
     if isinstance(model, DualARTransformer):
@@ -762,7 +766,7 @@ def launch_thread_safe_queue(
             model.setup_caches(
                 max_batch_size=1,
                 max_seq_len=min(model.config.max_seq_len, 4096),
-                dtype=next(model.parameters()).dtype,
+                dtype=torch.bfloat16 if "cuda" in str(device) else torch.float32,
             )
         init_event.set()
 

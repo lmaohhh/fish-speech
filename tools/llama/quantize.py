@@ -309,7 +309,7 @@ class NativeFP8Linear(torch.nn.Module):
                 x_fp8,
                 self.weight.t(),
                 scale_a=scale_x,
-                scale_b=self.scale.float().reshape(1),
+                scale_b=self.scale.to(device=input.device).float().reshape(1),
                 out_dtype=input.dtype,
             )
             return out.reshape(*orig_shape[:-1], self.out_features)
