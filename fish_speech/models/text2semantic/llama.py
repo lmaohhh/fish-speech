@@ -372,7 +372,7 @@ class BaseTransformer(nn.Module):
 
         for layer in self.layers:
             if self.config.use_gradient_checkpointing and self.training:
-                x = checkpoint(layer, x, freqs_cis, mask, use_reentrant=True)
+                x = checkpoint(layer, x, freqs_cis, mask, use_reentrant=False)
             else:
                 x = layer(x, freqs_cis, mask)
 
@@ -848,33 +848,30 @@ class DualARTransformer(BaseTransformer):
             codebooks = semantic_codebooks[:, :-1]
 
         x = self.fast_project_in(x)
-        codebook_embeddings = self.fast_embeddings(codebooks)
-        x = torch.cat([x[:, None], codebook_embeddings], dim=1)
 
-        def run_fast_transformer(fast_layers, h, freqs, mask):
-            for i in range(0, len(fast_layers), 2):
-                block = fast_layers[i : i + 2]
-                for l in block:
-                    h = l(h, freqs, mask)
-            return h
-
-        # Micro-chunking Fast Transformer (chunk_size=64)
-        # Slices tokens into chunks of 64 to avoid XLA tile padding explosion (saves >500 MB HBM)
+        # Micro-chunking Fast Transformer with on-the-fly embedding (chunk_size=64)
+        # Avoids allocating the 76.17 MB [1553, 10, 2560] buffer and saves >400 MB HBM
         if x.size(0) > 64:
             fast_chunks = []
             for start_idx in range(0, x.size(0), 64):
-                x_c = x[start_idx : start_idx + 64]
+                x_sub = x[start_idx : start_idx + 64]
+                cb_sub = codebooks[start_idx : start_idx + 64]
+                cb_embed_sub = self.fast_embeddings(cb_sub)
+                x_c = torch.cat([x_sub[:, None], cb_embed_sub], dim=1)
+
                 for layer in self.fast_layers:
                     if self.config.use_gradient_checkpointing and self.training:
-                        x_c = checkpoint(layer, x_c, fast_freqs_cis, fast_mask, use_reentrant=True)
+                        x_c = checkpoint(layer, x_c, fast_freqs_cis, fast_mask, use_reentrant=False)
                     else:
                         x_c = layer(x_c, fast_freqs_cis, fast_mask)
                 fast_chunks.append(x_c)
             x = torch.cat(fast_chunks, dim=0)
         else:
+            codebook_embeddings = self.fast_embeddings(codebooks)
+            x = torch.cat([x[:, None], codebook_embeddings], dim=1)
             for layer in self.fast_layers:
                 if self.config.use_gradient_checkpointing and self.training:
-                    x = checkpoint(layer, x, fast_freqs_cis, fast_mask, use_reentrant=True)
+                    x = checkpoint(layer, x, fast_freqs_cis, fast_mask, use_reentrant=False)
                 else:
                     x = layer(x, fast_freqs_cis, fast_mask)
 
