@@ -138,12 +138,23 @@ class TextToSemantic(L.LightningModule):
         filtered_codebook_labels = all_codebook_labels_permuted[semantic_mask]
 
         if outputs.fast_hidden_states is not None:
-            fast_logits = self.model.fast_output(outputs.fast_hidden_states)
-            semantic_loss = F.cross_entropy(
-                fast_logits.view(-1, fast_logits.size(-1)).float(),
-                filtered_codebook_labels.reshape(-1),
-                ignore_index=-100,
-            )
+            flat_fast_h = outputs.fast_hidden_states.reshape(-1, outputs.fast_hidden_states.size(-1))
+            flat_codebook_targets = filtered_codebook_labels.reshape(-1)
+            total_sem_loss = torch.tensor(0.0, device=base_loss.device, dtype=torch.float32)
+            total_sem_valid = (flat_codebook_targets != -100).sum()
+
+            for sem_start in range(0, flat_fast_h.size(0), 1280):
+                sem_end = min(sem_start + 1280, flat_fast_h.size(0))
+                chunk_sem_logits = self.model.fast_output(flat_fast_h[sem_start:sem_end])
+                chunk_sem_loss = F.cross_entropy(
+                    chunk_sem_logits.float(),
+                    flat_codebook_targets[sem_start:sem_end],
+                    ignore_index=-100,
+                    reduction="sum",
+                )
+                total_sem_loss = total_sem_loss + chunk_sem_loss
+
+            semantic_loss = total_sem_loss / torch.clamp(total_sem_valid.float(), min=1.0)
         else:
             semantic_loss = torch.tensor(0.0, device=base_loss.device)
 
