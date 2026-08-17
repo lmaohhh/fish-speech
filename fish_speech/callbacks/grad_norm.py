@@ -31,16 +31,23 @@ def grad_norm(
     if isinstance(parameters, Tensor):
         parameters = [parameters]
 
-    grads = [p.grad for p in parameters if p.grad is not None]
+    grads = [p.grad for p in parameters if p.requires_grad and p.grad is not None]
     if len(grads) == 0:
         return None
 
     first_device = grads[0].device
+    if first_device.type == "xla":
+        # Fast TPU norm
+        sq_sum = torch.tensor(0.0, device=first_device)
+        for g in grads:
+            sq_sum = sq_sum + (g ** 2).sum()
+        return torch.sqrt(sq_sum)
+
     grouped_grads: dict[
         tuple[torch.device, torch.dtype], list[list[Tensor]]
     ] = _group_tensors_by_device_and_dtype(
         [[g.detach() for g in grads]]
-    )  # type: ignore[assignment]
+    )
 
     norms = []
     for (device, _), ([grads], _) in grouped_grads.items():

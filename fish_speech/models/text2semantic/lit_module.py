@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import lightning as L
 import torch
@@ -65,6 +65,17 @@ class TextToSemantic(L.LightningModule):
                 "interval": "step",
             },
         }
+
+    def configure_gradient_clipping(
+        self,
+        optimizer,
+        gradient_clip_val: Optional[Union[int, float]] = None,
+        gradient_clip_algorithm: Optional[str] = None,
+    ):
+        if gradient_clip_val is None or gradient_clip_val <= 0:
+            return
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        torch.nn.utils.clip_grad_norm_(trainable_params, float(gradient_clip_val))
 
     def _step(self, batch, batch_idx, stage: str = "train"):
         is_train = stage == "train"
