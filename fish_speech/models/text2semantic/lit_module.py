@@ -128,7 +128,7 @@ class TextToSemantic(L.LightningModule):
             chunk_size=128,
         )
 
-        # 2. Vectorized Semantic Loss (Codebook vocab is only 4096, 8 MB total)
+        # 2. Static Vectorized Semantic Loss (100% Static Tensor for Zero-Recompilation)
         token_ids = labels[:, 0]
         semantic_mask = (token_ids >= self.model.tokenizer.semantic_begin_id) & (
             token_ids <= self.model.tokenizer.semantic_end_id
@@ -136,17 +136,12 @@ class TextToSemantic(L.LightningModule):
         all_codebook_labels = labels[:, 1 : 1 + self.model.config.num_codebooks]
         all_codebook_labels_permuted = all_codebook_labels.permute(0, 2, 1)
 
+        masked_codebook_labels = all_codebook_labels_permuted.clone()
+        masked_codebook_labels[~semantic_mask] = -100
+
         if outputs.fast_hidden_states is not None:
             flat_fast_h = outputs.fast_hidden_states.reshape(-1, outputs.fast_hidden_states.size(-1))
-            
-            if is_train:
-                codebook_targets = all_codebook_labels_permuted.clone()
-                codebook_targets[~semantic_mask] = -100
-                flat_codebook_targets = codebook_targets.reshape(-1)
-            else:
-                filtered_codebook_labels = all_codebook_labels_permuted[semantic_mask]
-                flat_codebook_targets = filtered_codebook_labels.reshape(-1)
-
+            flat_codebook_targets = masked_codebook_labels.reshape(-1)
             total_sem_loss = torch.tensor(0.0, device=base_loss.device, dtype=torch.float32)
             total_sem_valid = (flat_codebook_targets != -100).sum()
 
