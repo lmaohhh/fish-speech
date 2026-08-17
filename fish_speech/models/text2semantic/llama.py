@@ -581,45 +581,34 @@ class BaseTransformer(nn.Module):
             pth_file = path_obj / "model.pth"
 
             if index_json.exists() or single_st.exists():
-                from safetensors import safe_open
+                from safetensors.torch import load_file as st_load_file
                 if index_json.exists():
-                    logger.info(f"Streaming sharded safetensors weights directly to {_load_device} (0 MB RAM overhead)...")
+                    logger.info(f"Loading sharded safetensors weights to {_load_device}...")
                     with open(index_json) as f:
                         st_index = json.load(f)
                     shard_files = [path_obj / s for s in sorted(set(st_index["weight_map"].values()))]
                 else:
-                    logger.info(f"Streaming single safetensors weights directly to {_load_device}...")
+                    logger.info(f"Loading single safetensors weights to {_load_device}...")
                     shard_files = [single_st]
 
-                # Map state dict directly tensor-by-tensor
-                loaded_keys = set()
+                all_weights = {}
                 for shard_path in shard_files:
-                    with safe_open(str(shard_path), framework="pt", device=_load_device) as f:
-                        for key in f.keys():
-                            tensor = f.get_tensor(key)
-                            # Remap key if needed
-                            remapped_key = key
-                            if remapped_key.startswith("model."):
-                                remapped_key = remapped_key.replace("model.", "")
-                            if "audio_" in remapped_key:
-                                continue
-                            
-                            # Assign directly to model parameter / buffer
-                            target_mod = model
-                            parts = remapped_key.split(".")
-                            for p in parts[:-1]:
-                                if hasattr(target_mod, p):
-                                    target_mod = getattr(target_mod, p)
-                                else:
-                                    target_mod = None
-                                    break
-                            if target_mod is not None:
-                                p_name = parts[-1]
-                                if hasattr(target_mod, p_name):
-                                    setattr(target_mod, p_name, torch.nn.Parameter(tensor, requires_grad=False) if isinstance(getattr(target_mod, p_name, None), torch.nn.Parameter) else tensor)
-                                    loaded_keys.add(remapped_key)
-                
-                logger.info(f"Streamed {len(loaded_keys)} tensors safely into VRAM.")
+                    all_weights.update(st_load_file(str(shard_path), device=_load_device))
+
+                cleaned_weights = {}
+                for k, v in all_weights.items():
+                    k_clean = k
+                    if k_clean.startswith("model."):
+                        k_clean = k_clean.replace("model.", "")
+                    if "audio_" in k_clean:
+                        continue
+                    cleaned_weights[k_clean] = v
+
+                err = model.load_state_dict(cleaned_weights, strict=False, assign=True)
+                del all_weights, cleaned_weights
+                import gc
+                gc.collect()
+                logger.info(f"Safetensors weights loaded - Status: {err}")
             elif pth_file.exists():
                 logger.info(f"Loading model.pth weights to {_load_device}")
                 weights = torch.load(
