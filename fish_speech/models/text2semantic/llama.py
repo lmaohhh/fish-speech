@@ -735,12 +735,24 @@ class DualARTransformer(BaseTransformer):
         self.fast_embeddings = nn.Embedding(config.codebook_size, config.fast_dim)
 
         # The equivalent bs is so large that sdpa doesn't work
+        fast_n_head = config.fast_n_head or config.n_head
+        fast_n_local_heads = (
+            config.fast_n_local_heads
+            if (config.fast_n_local_heads is not None and config.fast_n_local_heads > 0)
+            else (
+                config.n_local_heads
+                if (config.n_local_heads is not None and config.n_local_heads > 0)
+                else fast_n_head
+            )
+        )
+        fast_head_dim = config.fast_head_dim or (config.fast_dim // fast_n_head)
+
         override_config = dataclasses.replace(
             config,
             dim=config.fast_dim,
-            n_head=config.fast_n_head,
-            n_local_heads=config.fast_n_local_heads,
-            head_dim=config.fast_head_dim,
+            n_head=fast_n_head,
+            n_local_heads=fast_n_local_heads,
+            head_dim=fast_head_dim,
             intermediate_size=config.fast_intermediate_size,
             attention_qkv_bias=config.fast_attention_qkv_bias,
             attention_qk_norm=config.fast_attention_qk_norm,
@@ -943,24 +955,36 @@ class Attention(nn.Module):
         super().__init__()
         assert config.dim % config.n_head == 0
 
-        total_head_dim = (config.n_head + 2 * config.n_local_heads) * config.head_dim
+        self.n_head = config.n_head
+        self.n_local_heads = (
+            config.n_local_heads
+            if (
+                config.n_local_heads is not None
+                and 0 < config.n_local_heads <= self.n_head
+            )
+            else self.n_head
+        )
+        self.head_dim = (
+            config.head_dim
+            if config.head_dim is not None
+            else (config.dim // config.n_head)
+        )
+
+        total_head_dim = (self.n_head + 2 * self.n_local_heads) * self.head_dim
         # key, query, value projections for all heads, but in a batch
         self.wqkv = nn.Linear(
             config.dim, total_head_dim, bias=config.attention_qkv_bias
         )
         self.wo = nn.Linear(
-            config.n_head * config.head_dim, config.dim, bias=config.attention_o_bias
+            self.n_head * self.head_dim, config.dim, bias=config.attention_o_bias
         )
         self.kv_cache = None
 
         if config.attention_qk_norm:
-            self.q_norm = nn.RMSNorm(config.head_dim, config.norm_eps)
-            self.k_norm = nn.RMSNorm(config.head_dim, config.norm_eps)
+            self.q_norm = nn.RMSNorm(self.head_dim, config.norm_eps)
+            self.k_norm = nn.RMSNorm(self.head_dim, config.norm_eps)
 
         self.dropout = config.dropout
-        self.n_head = config.n_head
-        self.head_dim = config.head_dim
-        self.n_local_heads = config.n_local_heads
         self.dim = config.dim
         self.use_sdpa = use_sdpa
         self.attention_qk_norm = config.attention_qk_norm
@@ -1004,8 +1028,9 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
-        k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+        if self.n_head > self.n_local_heads:
+            k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+            v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
 
         if self.use_sdpa:
             if mask is None:
