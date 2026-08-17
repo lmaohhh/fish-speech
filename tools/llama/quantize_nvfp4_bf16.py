@@ -40,12 +40,12 @@ DEQUANT_TABLE = torch.tensor(
 
 def quantize_tensor_to_nvfp4_block(
     tensor_float: torch.Tensor,
-    block_size: int = 32
+    block_size: int = 16
 ) -> Tuple[torch.Tensor, torch.Tensor, int, Tuple[int, ...]]:
     """
-    Nén ma trận trọng số sang chuẩn NVFP4 (E2M1 micro-scaling) theo block:
+    Nén ma trận trọng số sang chuẩn NVFP4 (E2M1 micro-scaling) theo chuẩn phần cứng Blackwell (Block 16 phần tử):
+    - 16 giá trị 4-bit (E2M1) chia sẻ 1 hệ số scale vi mô.
     - Trả về: (packed_weights, scales, pad_len, orig_shape)
-    - Tự động kiểm tra tính hợp lệ số học (NaN / Inf).
     """
     if not torch.isfinite(tensor_float).all():
         raise ValueError("Tensor chứa giá trị NaN hoặc Inf! Không thể lượng tử hóa.")
@@ -278,7 +278,7 @@ def quantize_dual_ar_model(
 @click.command()
 @click.option("--checkpoint-path", type=click.Path(exists=True), required=True, help="Input FP16/BF16 model directory")
 @click.option("--output", type=str, required=True, help="Output NVFP4 model directory")
-@click.option("--block-size", type=int, default=32, help="NVFP4 scaling block size (default 32)")
+@click.option("--block-size", type=int, default=16, help="NVFP4 scaling block size (NVIDIA Blackwell hardware standard: 16)")
 def main(checkpoint_path, output, block_size):
     quantize_dual_ar_model(Path(checkpoint_path), Path(output), block_size=block_size)
 
