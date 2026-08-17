@@ -970,7 +970,10 @@ class Attention(nn.Module):
 
         q_size = self.n_head * self.head_dim
         kv_size = self.n_local_heads * self.head_dim
-        q, k, v = self.wqkv(x).split([q_size, kv_size, kv_size], dim=-1)
+        qkv = self.wqkv(x)
+        q = qkv[..., :q_size]
+        k = qkv[..., q_size : q_size + kv_size]
+        v = qkv[..., q_size + kv_size :]
 
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
         k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -1092,8 +1095,8 @@ def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000) -> Tensor
 
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
-    xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
-    freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
+    xshaped = x.reshape(*x.shape[:-1], -1, 2)
+    freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2).type_as(x)
     x_out2 = torch.stack(
         [
             xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
@@ -1102,5 +1105,4 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
         -1,
     )
 
-    x_out2 = x_out2.flatten(3)
-    return x_out2.type_as(x)
+    return x_out2.flatten(3)
