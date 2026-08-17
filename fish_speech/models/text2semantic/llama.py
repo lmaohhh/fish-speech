@@ -574,12 +574,6 @@ class BaseTransformer(nn.Module):
                 model = simple_quantizer.convert_for_runtime()
 
             path_obj = Path(path)
-            if (path_obj / "quant_config.json").exists() or "nvfp4" in str(path_obj).lower():
-                logger.info("Using NVIDIA Blackwell NVFP4 weight-only quantization runtime handler!")
-                from tools.llama.quantize_nvfp4_bf16 import WeightOnlyNVFP4QuantHandler
-                simple_quantizer = WeightOnlyNVFP4QuantHandler(model)
-                model = simple_quantizer.convert_for_runtime()
-
             index_json = path_obj / "model.safetensors.index.json"
             single_st = path_obj / "model.safetensors"
             pth_file = path_obj / "model.pth"
