@@ -20,7 +20,8 @@ from fish_speech.models.text2semantic.lora import LoraConfig, setup_lora
 try:
     import torch_xla
     torch.xla = torch_xla
-except ImportError:
+    setattr(torch, "xla", torch_xla)
+except Exception:
     pass
 
 
@@ -362,6 +363,8 @@ class BaseTransformer(nn.Module):
 
         # Here we want to merge the embeddings of the codebooks
         x = self.embed(inp)
+        if self.training and not x.requires_grad:
+            x.requires_grad_(True)
 
         freqs_cis = self.freqs_cis[:seq_len]
 
@@ -381,8 +384,8 @@ class BaseTransformer(nn.Module):
 
         for i in range(0, len(self.layers), 2):
             block_layers = self.layers[i : i + 2]
-            if self.config.use_gradient_checkpointing and self.training and x.device.type != "xla":
-                x = checkpoint(run_layer_block, block_layers, x, freqs_cis, mask, use_reentrant=False)
+            if self.config.use_gradient_checkpointing and self.training:
+                x = checkpoint(run_layer_block, block_layers, x, freqs_cis, mask, use_reentrant=True)
             else:
                 x = run_layer_block(block_layers, x, freqs_cis, mask)
 
@@ -872,21 +875,13 @@ class DualARTransformer(BaseTransformer):
         if self.training and x.size(0) > 512:
             out_fast = torch.empty_like(x)
             chunk_size = 512
-            for i in range(0, x.size(0), chunk_size):
-                chunk_x = x[i : i + chunk_size]
-                if self.config.use_gradient_checkpointing and x.device.type != "xla":
-                    chunk_out = checkpoint(run_fast_transformer, self.fast_layers, chunk_x, fast_freqs_cis, fast_mask, use_reentrant=False)
-                else:
-                    chunk_out = run_fast_transformer(self.fast_layers, chunk_x, fast_freqs_cis, fast_mask)
-                out_fast[i : i + chunk_size] = chunk_out
-            x = out_fast
-        else:
-            for i in range(0, len(self.fast_layers), 2):
-                block_layers = self.fast_layers[i : i + 2]
-                if self.config.use_gradient_checkpointing and self.training and x.device.type != "xla":
-                    x = checkpoint(run_fast_transformer, self.fast_layers[i : i + 2], x, fast_freqs_cis, fast_mask, use_reentrant=False)
-                else:
-                    x = run_fast_transformer(self.fast_layers[i : i + 2], x, fast_freqs_cis, fast_mask)
+        # Fast layers checkpointing
+        for i in range(0, len(self.fast_layers), 2):
+            block_layers = self.fast_layers[i : i + 2]
+            if self.config.use_gradient_checkpointing and self.training:
+                x = checkpoint(run_fast_transformer, block_layers, x, fast_freqs_cis, fast_mask, use_reentrant=True)
+            else:
+                x = run_fast_transformer(block_layers, x, fast_freqs_cis, fast_mask)
 
         # unflatten the batch and num_codebooks
         fast_out = self.fast_norm(x)
