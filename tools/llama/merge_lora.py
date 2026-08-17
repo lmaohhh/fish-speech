@@ -3,10 +3,7 @@ import shutil
 from pathlib import Path
 
 import click
-import hydra
 import torch
-from hydra import compose, initialize
-from hydra.utils import instantiate
 from loguru import logger
 
 from fish_speech.models.text2semantic.llama import BaseTransformer
@@ -14,7 +11,7 @@ from fish_speech.models.text2semantic.lora import get_merged_state_dict
 
 
 @click.command()
-@click.option("--lora-config", type=str, default="r_8_alpha_16")
+@click.option("--lora-config", type=str, default="r_32_alpha_64")
 @click.option("--base-weight", type=str, default="checkpoints/fish-speech-1.4")
 @click.option("--lora-weight", type=str, required=True)
 @click.option("--output", type=str, required=True)
@@ -24,16 +21,27 @@ def merge(lora_config, base_weight, lora_weight, output):
         f"Merging {base_weight} and {lora_weight} into {output} with {lora_config}"
     )
 
-    with initialize(version_base="1.3", config_path="../../fish_speech/configs/lora"):
-        cfg = compose(config_name=lora_config)
-
-    lora_config = instantiate(cfg)
-    logger.info(f"Loaded lora model with config {lora_config}")
+    try:
+        from hydra import compose, initialize
+        from hydra.utils import instantiate
+        with initialize(version_base="1.3", config_path="../../fish_speech/configs/lora"):
+            cfg = compose(config_name=lora_config)
+        lora_config_obj = instantiate(cfg)
+    except Exception as e:
+        logger.warning(f"Hydra not available ({e}), using direct LoraConfig fallback")
+        from loralib import LoraConfig
+        lora_config_obj = LoraConfig(
+            r=32,
+            lora_alpha=64,
+            lora_dropout=0.05,
+            target_modules=["attention", "fast_attention"],
+        )
+    logger.info(f"Loaded lora model with config {lora_config_obj}")
 
     llama_model = BaseTransformer.from_pretrained(
         path=base_weight,
         load_weights=True,
-        lora_config=lora_config,
+        lora_config=lora_config_obj,
     )
     logger.info(f"Loaded llama model")
 
