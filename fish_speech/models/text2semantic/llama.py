@@ -575,7 +575,7 @@ class BaseTransformer(nn.Module):
             single_st = path_obj / "model.safetensors"
             pth_file = path_obj / "model.pth"
 
-            if index_json.exists():
+            if index_json.exists() and any((path_obj / shard).exists() for shard in json.load(open(index_json)).get("weight_map", {}).values()):
                 logger.info(f"Loading sharded safetensors weights to {_load_device}")
                 from safetensors.torch import load_file as st_load_file
 
@@ -593,6 +593,7 @@ class BaseTransformer(nn.Module):
                 weights = OrderedDict(st_load_file(str(single_st), device=_load_device))
                 weights = _remap_fish_qwen3_omni_keys(weights)
             elif pth_file.exists():
+                logger.info(f"Loading model.pth weights to {_load_device}")
                 weights = torch.load(
                     pth_file,
                     map_location=_load_device,

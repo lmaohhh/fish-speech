@@ -73,9 +73,11 @@ def merge(lora_config, base_weight, lora_weight, output):
     logger.info(f"⏳ Đang ghi mô hình 4.6B ra đĩa ({output}/model.pth)... Vui lòng đợi khoảng 20-30 giây...")
     llama_model.save_pretrained(output, drop_lora=True)
 
-    # Copy tokenizer and config files to output directory
+    # Copy tokenizer and config files to output directory (skip safetensors index)
     for file in Path(base_weight).glob("*"):
         if file.is_file() and file.suffix in [".json", ".tiktoken", ".txt", ".bin"]:
+            if "safetensors" in file.name:
+                continue
             dest = output / file.name
             if not dest.exists():
                 shutil.copyfile(file, dest)
