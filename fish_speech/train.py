@@ -1,8 +1,15 @@
+import multiprocessing as mp
 import os
 import sys
 
-os.environ["USE_LIBUV"] = "0"
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
 
+os.environ["USE_LIBUV"] = "0"
+os.environ["PJRT_SPAWN_METHOD"] = "spawn"
+os.environ["TORCH_XLA_START_METHOD"] = "spawn"
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 from typing import Optional
