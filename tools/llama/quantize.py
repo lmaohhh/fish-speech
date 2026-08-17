@@ -175,8 +175,11 @@ class QuantHandler:
 ##### Weight-only int8 per-channel quantized code ######
 
 
-def replace_linear_weight_only_int8_per_channel(module):
+def replace_linear_weight_only_int8_per_channel(module, prefix=""):
     for name, child in module.named_children():
+        fqn = f"{prefix}.{name}" if prefix else name
+        if "fast_layers" in fqn or "fast_output" in fqn:
+            continue
         if isinstance(child, nn.Linear):
             setattr(
                 module,
@@ -184,7 +187,7 @@ def replace_linear_weight_only_int8_per_channel(module):
                 WeightOnlyInt8Linear(child.in_features, child.out_features),
             )
         else:
-            replace_linear_weight_only_int8_per_channel(child)
+            replace_linear_weight_only_int8_per_channel(child, fqn)
 
 
 class WeightOnlyInt8QuantHandler:
@@ -195,6 +198,8 @@ class WeightOnlyInt8QuantHandler:
     def create_quantized_state_dict(self):
         cur_state_dict = self.mod.state_dict()
         for fqn, mod in self.mod.named_modules():
+            if "fast_layers" in fqn or "fast_output" in fqn:
+                continue
             if isinstance(mod, torch.nn.Linear):
                 int8_weight, scales, _ = dynamically_quantize_per_channel(
                     mod.weight.float(), -128, 127, torch.int8
@@ -264,8 +269,11 @@ def _check_linear_int4_k(k, groupsize=1, inner_k_tiles=1):
     return k % groupsize == 0 and k % (inner_k_tiles * 16) == 0
 
 
-def replace_linear_int4(module, groupsize, inner_k_tiles, padding):
+def replace_linear_int4(module, groupsize, inner_k_tiles, padding, prefix=""):
     for name, child in module.named_children():
+        fqn = f"{prefix}.{name}" if prefix else name
+        if "fast_layers" in fqn or "fast_output" in fqn:
+            continue
         if isinstance(child, nn.Linear):
             if _check_linear_int4_k(child.in_features, groupsize, inner_k_tiles):
                 setattr(
@@ -294,7 +302,7 @@ def replace_linear_int4(module, groupsize, inner_k_tiles, padding):
                     ),
                 )
         else:
-            replace_linear_int4(child, groupsize, inner_k_tiles, padding)
+            replace_linear_int4(child, groupsize, inner_k_tiles, padding, fqn)
 
 
 class WeightOnlyInt4QuantHandler:
@@ -310,6 +318,8 @@ class WeightOnlyInt4QuantHandler:
     def create_quantized_state_dict(self):
         cur_state_dict = self.mod.state_dict()
         for fqn, mod in self.mod.named_modules():
+            if "fast_layers" in fqn or "fast_output" in fqn:
+                continue
             if isinstance(mod, torch.nn.Linear):
                 assert not mod.bias
                 out_features = mod.out_features
@@ -341,7 +351,7 @@ class WeightOnlyInt4QuantHandler:
                     weight_int4pack,
                     scales_and_zeros,
                 ) = prepare_int4_weight_and_scales_and_zeros(
-                    weight.to(torch.bfloat16).to("cuda"),
+                    weight.to(torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu"),
                     self.groupsize,
                     self.inner_k_tiles,
                 )
@@ -436,13 +446,14 @@ def generate_folder_name():
 @click.option(
     "--groupsize", type=int, default=128, help="Group size for int4 quantization."
 )
+@click.option("--output", type=str, default=None, help="Custom output directory path")
 @click.option("--timestamp", type=str, default="None", help="When to do quantization")
-def quantize(checkpoint_path: Path, mode: str, groupsize: int, timestamp: str) -> None:
+def quantize(checkpoint_path: Path, mode: str, groupsize: int, output: str, timestamp: str) -> None:
 
     device = "cpu"
     precision = torch.bfloat16
 
-    print("Loading model ...")
+    print(f"Loading model from {checkpoint_path} ...")
     t0 = time.time()
 
     model, _ = init_model(
@@ -454,43 +465,40 @@ def quantize(checkpoint_path: Path, mode: str, groupsize: int, timestamp: str) -
     vq_model = "codec.pth"
     now = timestamp if timestamp != "None" else generate_folder_name()
 
+    if output is not None:
+        dst_name = Path(output)
+    elif mode == "int8":
+        dst_name = Path(f"checkpoints/fs-int8-{now}")
+    elif mode == "int4":
+        dst_name = Path(f"checkpoints/fs-int4-g{groupsize}-{now}")
+    else:
+        raise ValueError(f"Invalid quantization mode {mode} (must be int8 or int4)")
+
+    if dst_name.exists():
+        shutil.rmtree(dst_name)
+    shutil.copytree(str(checkpoint_path.resolve()), str(dst_name.resolve()))
+    if (dst_name / vq_model).exists():
+        (dst_name / vq_model).unlink()
+    for old_f in dst_name.glob("model*.*"):
+        old_f.unlink(missing_ok=True)
+
     if mode == "int8":
         print(
-            "Quantizing model weights for int8 weight-only symmetric per-channel quantization"
+            "Quantizing Slow AR weights for INT8 per-channel (Fast AR preserved in BF16)..."
         )
         quant_handler = WeightOnlyInt8QuantHandler(model)
         quantized_state_dict = quant_handler.create_quantized_state_dict()
-
-        dir_name = checkpoint_path
-        dst_name = Path(f"checkpoints/fs-1.2-int8-{now}")
-        shutil.copytree(str(dir_name.resolve()), str(dst_name.resolve()))
-        if (dst_name / vq_model).exists():
-            (dst_name / vq_model).unlink()
-        quantize_path = dst_name / "model.pth"
-
     elif mode == "int4":
         print(
-            "Quantizing model weights for int4 weight-only affine per-channel groupwise quantization"
+            f"Quantizing Slow AR weights for INT4 group={groupsize} (Fast AR preserved in BF16)..."
         )
         quant_handler = WeightOnlyInt4QuantHandler(model, groupsize)
         quantized_state_dict = quant_handler.create_quantized_state_dict()
 
-        dir_name = checkpoint_path
-        dst_name = Path(f"checkpoints/fs-1.2-int4-g{groupsize}-{now}")
-        shutil.copytree(str(dir_name.resolve()), str(dst_name.resolve()))
-        if (dst_name / vq_model).exists():
-            (dst_name / vq_model).unlink()
-        quantize_path = dst_name / "model.pth"
-
-    else:
-        raise ValueError(
-            f"Invalid quantization mode {mode} needs to be one of [int8, int4, int4-gpptq]"
-        )
-
-    print(f"Writing quantized weights to {quantize_path}")
-    quantize_path.unlink(missing_ok=True)  # remove existing file if one already there
+    quantize_path = dst_name / "model.pth"
+    print(f"Writing quantized weights to {quantize_path} ...")
     torch.save(quantized_state_dict, quantize_path)
-    print(f"Quantization complete took {time.time() - t0:.02f} seconds")
+    print(f"🎉 Quantization complete took {time.time() - t0:.02f}s! Output saved to: {dst_name}")
 
 
 if __name__ == "__main__":
