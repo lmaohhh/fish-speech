@@ -33,7 +33,7 @@ def parse_args():
     )
     parser.add_argument("--decoder-config-name", type=str, default="modded_dac_vq")
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--decoder-device", type=str, default="cpu")
+    parser.add_argument("--decoder-device", type=str, default="cuda")
     parser.add_argument("--half", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--max-gradio-length", type=int, default=0)

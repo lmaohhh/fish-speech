@@ -26,8 +26,14 @@ def load_model(config_name, checkpoint_path, device="cuda"):
         cfg = compose(config_name=config_name)
 
     model = instantiate(cfg)
+    
+    # Loại bỏ module encoder không sử dụng trong TTS để tiết kiệm bộ nhớ
+    if hasattr(model, "encoder"):
+        del model.encoder
+        model.encoder = None
+
     state_dict = torch.load(
-        checkpoint_path, map_location=device, mmap=True, weights_only=True
+        checkpoint_path, map_location="cpu", weights_only=True
     )
     if "state_dict" in state_dict:
         state_dict = state_dict["state_dict"]
@@ -39,11 +45,22 @@ def load_model(config_name, checkpoint_path, device="cuda"):
             if "generator." in k
         }
 
+    # Bỏ qua các key thuộc encoder trong state_dict
+    state_dict = {k: v for k, v in state_dict.items() if not k.startswith("encoder.")}
+
     result = model.load_state_dict(state_dict, strict=False, assign=True)
     model.eval()
-    model.to(device)
+    
+    if device != "cpu":
+        model.to(device)
 
-    logger.info(f"Loaded model: {result}")
+    import gc
+    del state_dict
+    gc.collect()
+    if "cuda" in str(device) and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    logger.info(f"Loaded trimmed DAC decoder on {device}: {result}")
     return model
 
 
