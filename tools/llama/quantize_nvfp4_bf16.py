@@ -187,9 +187,9 @@ def quantize_dual_ar_model(
 
 
 @click.command()
-@click.option("--checkpoint-path", type=click.Path(exists=True), required=True, help="Đường dẫn thư mục model gốc")
-@click.option("--output", type=str, required=True, help="Thư mục xuất model NVFP4")
-@click.option("--block-size", type=int, default=32, help="Kích thước block scaling NVFP4 (mặc định 32)")
+@click.option("--checkpoint-path", type=click.Path(exists=True), required=True, help="Input FP16/BF16 model directory")
+@click.option("--output", type=str, required=True, help="Output NVFP4 model directory")
+@click.option("--block-size", type=int, default=32, help="NVFP4 scaling block size (default 32)")
 def main(checkpoint_path, output, block_size):
     quantize_dual_ar_model(Path(checkpoint_path), Path(output), block_size)
 
