@@ -549,7 +549,13 @@ class BaseTransformer(nn.Module):
         if load_weights is False:
             logger.info("Randomly initialized model")
         else:
-            if "fp8" in str(Path(path)).lower():
+            if "nvfp4" in str(Path(path)).lower():
+                logger.info("Using Native Blackwell NVFP4 (E2M1 Block-16) Hardware Acceleration!")
+                from tools.llama.quantize import NVFP4QuantHandler
+
+                simple_quantizer = NVFP4QuantHandler(model)
+                model = simple_quantizer.convert_for_runtime()
+            elif "fp8" in str(Path(path)).lower():
                 logger.info("Using Native Blackwell FP8 (E4M3) Hardware Acceleration!")
                 from tools.llama.quantize import FP8QuantHandler
 

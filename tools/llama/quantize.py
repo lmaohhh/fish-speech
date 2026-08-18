@@ -317,6 +317,99 @@ class NativeFP8Linear(torch.nn.Module):
             return F.linear(input, self.weight.float() * self.scale.float()).to(input.dtype)
 
 
+##### Native Blackwell NVFP4 (E2M1 + Block-16 FP8) Hardware Accelerated Code ######
+
+
+def replace_linear_native_nvfp4(module, prefix=""):
+    for name, child in module.named_children():
+        fqn = f"{prefix}.{name}" if prefix else name
+        if "fast_layers" in fqn or "fast_output" in fqn or "fast_project" in fqn:
+            continue
+        if isinstance(child, nn.Linear):
+            setattr(
+                module,
+                name,
+                NativeNVFP4Linear(child.in_features, child.out_features),
+            )
+        else:
+            replace_linear_native_nvfp4(child, fqn)
+
+
+class NVFP4QuantHandler:
+    """
+    Quantization handler that converts Slow Transformer linear layers to NativeNVFP4Linear
+    for direct hardware-accelerated execution on NVIDIA Blackwell.
+    """
+    def __init__(self, mod):
+        self.mod = mod
+
+    def convert_for_runtime(self):
+        replace_linear_native_nvfp4(self.mod)
+        return self.mod
+
+
+class NativeNVFP4Linear(torch.nn.Module):
+    """
+    Native Blackwell NVFP4 Linear Layer (E2M1 + Block-16 FP8 scale + Global FP32 scale).
+    """
+    __constants__ = ["in_features", "out_features"]
+    in_features: int
+    out_features: int
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.register_buffer(
+            "nvfp4_weight",
+            torch.empty((out_features, in_features // 2), dtype=torch.uint8, device=device),
+        )
+        self.register_buffer(
+            "nvfp4_block_scales",
+            torch.empty((out_features, in_features // 16), dtype=torch.float8_e4m3fn, device=device),
+        )
+        self.register_buffer(
+            "nvfp4_global_scale",
+            torch.tensor(1.0, dtype=torch.float32, device=device),
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        orig_shape = input.shape
+        flat_x = input.reshape(-1, self.in_features)
+
+        # 1. Thử gọi backend C++/CUDA CUTLASS 3.8 nếu đã compile plugin
+        try:
+            import qutlass
+            return qutlass.matmul_nvf4_bf16_tn(
+                flat_x, self.nvfp4_weight, None, self.nvfp4_block_scales, self.nvfp4_global_scale
+            ).reshape(*orig_shape[:-1], self.out_features)
+        except Exception:
+            # 2. Vectorized Fast Execution Fallback
+            high_codes = (self.nvfp4_weight >> 4) & 0x0F
+            low_codes = self.nvfp4_weight & 0x0F
+            codes = torch.empty(
+                (self.out_features, self.in_features),
+                dtype=torch.uint8,
+                device=self.nvfp4_weight.device,
+            )
+            codes[:, 0::2] = high_codes
+            codes[:, 1::2] = low_codes
+
+            from tools.llama.quantize_nvfp4_bf16 import DEQUANT_TABLE
+            table = DEQUANT_TABLE.to(self.nvfp4_weight.device)
+            w_vals = table[codes.long()].reshape(self.out_features, self.in_features // 16, 16)
+            eff_scales = (self.nvfp4_block_scales.float() * float(self.nvfp4_global_scale)).unsqueeze(-1)
+            w_dequant = (w_vals * eff_scales).reshape(self.out_features, self.in_features).to(input.dtype)
+            return F.linear(flat_x, w_dequant).reshape(*orig_shape[:-1], self.out_features)
+
+
 ##### weight only int4 per channel groupwise quantized code ######
 
 
