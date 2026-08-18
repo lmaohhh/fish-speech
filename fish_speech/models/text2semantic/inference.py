@@ -362,12 +362,12 @@ def generate(
 def init_model(checkpoint_path, device, precision, compile=False):
     model = DualARTransformer.from_pretrained(checkpoint_path, load_weights=True)
 
-    # Do NOT cast FP8 models to precision because it dequantizes FP8 back to BF16 and doubles VRAM
-    if "fp8" not in str(Path(checkpoint_path)).lower() and "int" not in str(Path(checkpoint_path)).lower():
+    # Do NOT cast NVFP4/FP8 models to precision because it ruins native hardware buffers and inflates VRAM
+    if not any(k in str(Path(checkpoint_path)).lower() for k in ["nvfp4", "fp8", "int"]):
         model = model.to(device=device, dtype=precision)
     else:
         model = model.to(device=device)
-    logger.info(f"Restored model from checkpoint")
+    logger.info(f"Restored model from checkpoint (Zero Dequant Guard Active)")
 
     if isinstance(model, DualARTransformer):
         decode_one_token = decode_one_token_ar

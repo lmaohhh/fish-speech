@@ -298,23 +298,20 @@ class NativeFP8Linear(torch.nn.Module):
         )
         self.register_buffer("scale", torch.ones(1, dtype=torch.float32, device=device))
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if input.is_cuda and hasattr(torch, "_scaled_mm"):
-            orig_shape = input.shape
-            flat_x = input.reshape(-1, self.in_features)
-            scale_x = (flat_x.abs().max() / 448.0).clamp(min=1e-12).float().reshape(1)
-            x_fp8 = torch.clamp(flat_x.float() / scale_x, -448.0, 448.0).to(torch.float8_e4m3fn)
+        assert input.is_cuda and hasattr(torch, "_scaled_mm"), "NativeFP8Linear requires CUDA with hardware _scaled_mm support"
+        orig_shape = input.shape
+        flat_x = input.reshape(-1, self.in_features)
+        scale_x = (flat_x.abs().max() / 448.0).clamp(min=1e-12).float().reshape(1)
+        x_fp8 = torch.clamp(flat_x.float() / scale_x, -448.0, 448.0).to(torch.float8_e4m3fn)
 
-            out = torch._scaled_mm(
-                x_fp8,
-                self.weight.t(),
-                scale_a=scale_x,
-                scale_b=self.scale.to(device=input.device).float().reshape(1),
-                out_dtype=input.dtype,
-            )
-            return out.reshape(*orig_shape[:-1], self.out_features)
-        else:
-            return F.linear(input, self.weight.float() * self.scale.float()).to(input.dtype)
+        out = torch._scaled_mm(
+            x_fp8,
+            self.weight.t(),
+            scale_a=scale_x,
+            scale_b=self.scale.to(device=input.device).float().reshape(1),
+            out_dtype=input.dtype,
+        )
+        return out.reshape(*orig_shape[:-1], self.out_features)
 
 
 ##### Native Blackwell NVFP4 (E2M1 + Block-16 FP8) Hardware Accelerated Code ######
