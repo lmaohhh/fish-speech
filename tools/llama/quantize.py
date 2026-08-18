@@ -381,33 +381,19 @@ class NativeNVFP4Linear(torch.nn.Module):
         )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        import qutlass
         orig_shape = input.shape
         flat_x = input.reshape(-1, self.in_features)
 
-        # 1. Thử gọi backend C++/CUDA CUTLASS 3.8 nếu đã compile plugin
-        try:
-            import qutlass
-            return qutlass.matmul_nvf4_bf16_tn(
-                flat_x, self.nvfp4_weight, None, self.nvfp4_block_scales, self.nvfp4_global_scale
-            ).reshape(*orig_shape[:-1], self.out_features)
-        except Exception:
-            # 2. Vectorized Fast Execution Fallback
-            high_codes = (self.nvfp4_weight >> 4) & 0x0F
-            low_codes = self.nvfp4_weight & 0x0F
-            codes = torch.empty(
-                (self.out_features, self.in_features),
-                dtype=torch.uint8,
-                device=self.nvfp4_weight.device,
-            )
-            codes[:, 0::2] = high_codes
-            codes[:, 1::2] = low_codes
-
-            from tools.llama.quantize_nvfp4_bf16 import DEQUANT_TABLE
-            table = DEQUANT_TABLE.to(self.nvfp4_weight.device)
-            w_vals = table[codes.long()].reshape(self.out_features, self.in_features // 16, 16)
-            eff_scales = (self.nvfp4_block_scales.float() * float(self.nvfp4_global_scale)).unsqueeze(-1)
-            w_dequant = (w_vals * eff_scales).reshape(self.out_features, self.in_features).to(input.dtype)
-            return F.linear(flat_x, w_dequant).reshape(*orig_shape[:-1], self.out_features)
+        # Gọi trực tiếp vi mã phần cứng tcgen05.mma trên 5th-Gen Tensor Core Blackwell (Zero Dequant)
+        out = qutlass.matmul_nvf4_bf16_tn(
+            flat_x,
+            self.nvfp4_weight,
+            None,
+            self.nvfp4_block_scales,
+            self.nvfp4_global_scale,
+        )
+        return out.reshape(*orig_shape[:-1], self.out_features)
 
 
 ##### weight only int4 per channel groupwise quantized code ######
